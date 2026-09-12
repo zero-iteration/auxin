@@ -1,0 +1,90 @@
+# =============================================================================
+# auxin — raise progressDeadlineSeconds on instrumented Deployments
+# =============================================================================
+# R9 asks for a raised progressDeadlineSeconds. That field does NOT exist on a Pod, so
+# a pod webhook physically cannot set it — it belongs to Deployment.spec. Hence a second,
+# separate policy with its own webhook registration, matching Deployments only.
+#
+# Why it matters: the default is 600s. A11 documented an OTel-instrumented service whose
+# CPU spike persisted 10-14 minutes and normalised only after ~15. Combined with our own
+# startupProbe budget (30 x 10s = 300s per pod) a rolling update can legitimately exceed
+# 600s and be marked ProgressDeadlineExceeded while it is in fact healthy-but-slow.
+#
+# Separate policy, not an extra rule in ax-inject-policy.yaml, because that policy's
+# objectSelector filters on a POD label; a Deployment does not carry it (the label is on
+# .spec.template.metadata.labels), so the API server would filter the Deployment out.
+#
+# Mutate-only. failurePolicy Ignore. No validate, no deny. (R1, R2)
+#
+# >>> EXECUTED offline by `kyverno apply` — deploy/verify.sh phase 1 runs it against
+#     deploy/test/ and asserts the result. Not applied to a real cluster.
+# =============================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: auxin-rollout
+  labels:
+    app.kubernetes.io/name: auxin-inject
+    app.kubernetes.io/part-of: auxin
+  annotations:
+    policies.kyverno.io/title: Auxin rollout deadline
+    policies.kyverno.io/category: Auxin
+    policies.kyverno.io/severity: low
+    policies.kyverno.io/subject: Deployment
+    policies.kyverno.io/description: >-
+      Raises progressDeadlineSeconds on Deployments whose pod template opts into
+      Auxin injection, so that a slow-but-healthy instrumented rollout is not
+      marked ProgressDeadlineExceeded.
+spec:
+  failurePolicy: Ignore          # R1
+  webhookTimeoutSeconds: 2       # R5
+  admission: true
+  background: false
+  mutateExistingOnPolicyUpdate: false
+  # THERE IS DELIBERATELY NO `spec.webhookConfiguration` BLOCK. See the long note in
+  # ax-inject-policy.yaml. Short version, proved with `kyverno` CLI 1.19.1:
+  #   * `spec.webhookConfiguration.namespaceSelector` is NOT a Kyverno field. The loader
+  #     rejects it ("value provided for unknown field"), silently drops the whole file,
+  #     and still prints `Applying 0 policy rule(s)` / `error: 0` / exit 0. A real API
+  #     server prunes it instead, so it never filtered anything either way.
+  #   * `spec.webhookConfiguration.matchConditions` IS a real field, but it segfaults
+  #     `kyverno apply` and `kyverno test` when they run without a cluster
+  #     (pkg/validation/policy/validate.go:126), which would make this file untestable.
+  # The opt-in and namespace exclusions below are engine-side and are exercised by
+  # deploy/verify.sh against test/deployments.yaml.
+  rules:
+    - name: gt-rollout-progress-deadline
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+              operations:
+                - CREATE
+                - UPDATE
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                - kyverno
+                - auxin-system
+      preconditions:
+        all:
+          # Engine-side repeat of the CEL condition above, for clusters < 1.28 where
+          # matchConditions are ignored.
+          - key: "{{ request.object.spec.template.metadata.labels.\"auxin.dev/inject\" || '' }}"
+            operator: Equals
+            value: "true"
+          - key: "{{ request.object.spec.template.metadata.labels.\"auxin.dev/inject-optout\" || '' }}"
+            operator: NotEquals
+            value: "true"
+      mutate:
+        patchStrategicMerge:
+          spec:
+            # max() keeps this idempotent and never lowers a deliberately larger value.
+            # 1200s = 300s startupProbe budget + headroom for a multi-replica rolling
+            # update where each pod pays the transform cost.
+            progressDeadlineSeconds: "{{ max([to_number(to_string(request.object.spec.progressDeadlineSeconds || `600`)), `1200`]) }}"

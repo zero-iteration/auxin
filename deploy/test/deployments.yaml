@@ -1,0 +1,53 @@
+---
+# gt-rollout: opted-in pod template with the k8s default progressDeadlineSeconds absent.
+# Must be raised to 1200.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dep-a-optin
+  namespace: default
+spec:
+  selector: { matchLabels: { app: a } }
+  template:
+    metadata:
+      labels:
+        app: a
+        auxin.dev/inject: "true"
+    spec:
+      containers:
+        - name: app
+          image: demo:1
+---
+# Already generous: 1800 > 1200. max() must NOT lower it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dep-b-already-generous
+  namespace: default
+spec:
+  progressDeadlineSeconds: 1800
+  selector: { matchLabels: { app: b } }
+  template:
+    metadata:
+      labels:
+        app: b
+        auxin.dev/inject: "true"
+    spec:
+      containers:
+        - name: app
+          image: demo:1
+---
+# Not opted in. Must be untouched.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dep-c-not-opted-in
+  namespace: default
+spec:
+  selector: { matchLabels: { app: c } }
+  template:
+    metadata: { labels: { app: c } }
+    spec:
+      containers:
+        - name: app
+          image: demo:1

@@ -1,0 +1,489 @@
+{
+  "schemaVersion": 1,
+  "buildSha": "j8test",
+  "artifact": "j8",
+  "generatedAt": "2026-09-12T09:01:57Z",
+  "classes": [
+    {
+      "name": "Collector",
+      "sourceFile": "Collector.java",
+      "probeCount": 2,
+      "schemaHash": "f127770f6753cac388f533b9f9dbacea800973f43ac3e9e1bed206189ad1806c",
+      "isPublicApi": true,
+      "isTest": false,
+      "methods": [
+        {
+          "idx": 0,
+          "name": "<init>",
+          "desc": "()V",
+          "line": 4,
+          "access": "public",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": false,
+          "shortCircuitable": false,
+          "sccId": 0,
+          "testOnlyReachable": null
+        },
+        {
+          "idx": 1,
+          "name": "main",
+          "desc": "([Ljava/lang/String;)V",
+          "line": 6,
+          "access": "public",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": true,
+          "shortCircuitable": false,
+          "sccId": 1,
+          "testOnlyReachable": false
+        }
+      ]
+    },
+    {
+      "name": "Collector$1",
+      "sourceFile": "Collector.java",
+      "probeCount": 2,
+      "schemaHash": "57cda5743dbf051d74f7f800d916ee7700d5679c395a5ecf6b2267b0770a1256",
+      "isPublicApi": false,
+      "isTest": false,
+      "methods": [
+        {
+          "idx": 0,
+          "name": "<init>",
+          "desc": "()V",
+          "line": 7,
+          "access": "package-private",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": false,
+          "shortCircuitable": false,
+          "sccId": 2,
+          "testOnlyReachable": false
+        },
+        {
+          "idx": 1,
+          "name": "handle",
+          "desc": "(Lcom/sun/net/httpserver/HttpExchange;)V",
+          "line": 9,
+          "access": "public",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": true,
+          "shortCircuitable": false,
+          "sccId": 3,
+          "testOnlyReachable": null
+        }
+      ]
+    },
+    {
+      "name": "Loop",
+      "sourceFile": "Loop.java",
+      "probeCount": 2,
+      "schemaHash": "f127770f6753cac388f533b9f9dbacea800973f43ac3e9e1bed206189ad1806c",
+      "isPublicApi": true,
+      "isTest": false,
+      "methods": [
+        {
+          "idx": 0,
+          "name": "<init>",
+          "desc": "()V",
+          "line": 1,
+          "access": "public",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": false,
+          "shortCircuitable": false,
+          "sccId": 4,
+          "testOnlyReachable": null
+        },
+        {
+          "idx": 1,
+          "name": "main",
+          "desc": "([Ljava/lang/String;)V",
+          "line": 2,
+          "access": "public",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": true,
+          "shortCircuitable": false,
+          "sccId": 5,
+          "testOnlyReachable": false
+        }
+      ]
+    },
+    {
+      "name": "T",
+      "sourceFile": "T.java",
+      "probeCount": 5,
+      "schemaHash": "f717091d5c9095853a33e9d0cd7b1f32e02f01c0fb8f1ada50d4d964843e2503",
+      "isPublicApi": true,
+      "isTest": false,
+      "methods": [
+        {
+          "idx": 0,
+          "name": "<init>",
+          "desc": "()V",
+          "line": 1,
+          "access": "public",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": false,
+          "shortCircuitable": false,
+          "sccId": 6,
+          "testOnlyReachable": false
+        },
+        {
+          "idx": 1,
+          "name": "alpha",
+          "desc": "(I)I",
+          "line": 3,
+          "access": "public",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": true,
+          "shortCircuitable": false,
+          "sccId": 7,
+          "testOnlyReachable": false
+        },
+        {
+          "idx": 2,
+          "name": "beta",
+          "desc": "(I)I",
+          "line": 4,
+          "access": "public",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": true,
+          "shortCircuitable": false,
+          "sccId": 8,
+          "testOnlyReachable": null
+        },
+        {
+          "idx": 3,
+          "name": "gamma",
+          "desc": "(Ljava/lang/String;)Ljava/lang/String;",
+          "line": 5,
+          "access": "public",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": true,
+          "shortCircuitable": false,
+          "sccId": 9,
+          "testOnlyReachable": false
+        },
+        {
+          "idx": 4,
+          "name": "main",
+          "desc": "([Ljava/lang/String;)V",
+          "line": 7,
+          "access": "public",
+          "synthetic": false,
+          "tier2": false,
+          "dynamicallyObservable": true,
+          "shortCircuitable": false,
+          "sccId": 10,
+          "testOnlyReachable": false
+        }
+      ]
+    }
+  ],
+  "entryPoints": [
+    {
+      "class": "Collector",
+      "method": "main",
+      "desc": "([Ljava/lang/String;)V",
+      "kind": "main"
+    },
+    {
+      "class": "Loop",
+      "method": "main",
+      "desc": "([Ljava/lang/String;)V",
+      "kind": "main"
+    },
+    {
+      "class": "T",
+      "method": "main",
+      "desc": "([Ljava/lang/String;)V",
+      "kind": "main"
+    }
+  ],
+  "callEdges": [
+    {
+      "from": "Collector#<init>()V",
+      "to": "java.lang.Object#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector#main([Ljava/lang/String;)V",
+      "to": "Collector$1#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector#main([Ljava/lang/String;)V",
+      "to": "com.sun.net.httpserver.HttpServer#create(Ljava/net/InetSocketAddress;I)Lcom/sun/net/httpserver/HttpServer;",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector#main([Ljava/lang/String;)V",
+      "to": "com.sun.net.httpserver.HttpServer#createContext(Ljava/lang/String;Lcom/sun/net/httpserver/HttpHandler;)Lcom/sun/net/httpserver/HttpContext;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector#main([Ljava/lang/String;)V",
+      "to": "com.sun.net.httpserver.HttpServer#start()V",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector#main([Ljava/lang/String;)V",
+      "to": "com.sun.net.httpserver.HttpServer#stop(I)V",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector#main([Ljava/lang/String;)V",
+      "to": "java.lang.Thread#sleep(J)V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector#main([Ljava/lang/String;)V",
+      "to": "java.net.InetSocketAddress#<init>(I)V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#<init>()V",
+      "to": "java.lang.Object#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "com.sun.net.httpserver.Headers#getFirst(Ljava/lang/String;)Ljava/lang/String;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "com.sun.net.httpserver.HttpExchange#close()V",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "com.sun.net.httpserver.HttpExchange#getRequestBody()Ljava/io/InputStream;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "com.sun.net.httpserver.HttpExchange#getRequestHeaders()Lcom/sun/net/httpserver/Headers;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "com.sun.net.httpserver.HttpExchange#getRequestURI()Ljava/net/URI;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "com.sun.net.httpserver.HttpExchange#sendResponseHeaders(IJ)V",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.io.ByteArrayOutputStream#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.io.ByteArrayOutputStream#toString(Ljava/lang/String;)Ljava/lang/String;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.io.ByteArrayOutputStream#write([BII)V",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.io.InputStream#read([B)I",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.io.PrintStream#println(Ljava/lang/String;)V",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.lang.String#equals(Ljava/lang/Object;)Z",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.lang.StringBuilder#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.lang.StringBuilder#append(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.lang.StringBuilder#append(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.lang.StringBuilder#toString()Ljava/lang/String;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Collector$1#handle(Lcom/sun/net/httpserver/HttpExchange;)V",
+      "to": "java.util.zip.GZIPInputStream#<init>(Ljava/io/InputStream;)V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Loop#<init>()V",
+      "to": "java.lang.Object#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Loop#main([Ljava/lang/String;)V",
+      "to": "T#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Loop#main([Ljava/lang/String;)V",
+      "to": "T#alpha()I",
+      "resolution": "cha",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Loop#main([Ljava/lang/String;)V",
+      "to": "T#gamma()I",
+      "resolution": "cha",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Loop#main([Ljava/lang/String;)V",
+      "to": "java.io.PrintStream#println(Ljava/lang/String;)V",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "Loop#main([Ljava/lang/String;)V",
+      "to": "java.lang.Thread#sleep(J)V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#<init>()V",
+      "to": "java.lang.Object#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#gamma(Ljava/lang/String;)Ljava/lang/String;",
+      "to": "java.lang.String#charAt(I)C",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#gamma(Ljava/lang/String;)Ljava/lang/String;",
+      "to": "java.lang.String#length()I",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#gamma(Ljava/lang/String;)Ljava/lang/String;",
+      "to": "java.lang.StringBuilder#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#gamma(Ljava/lang/String;)Ljava/lang/String;",
+      "to": "java.lang.StringBuilder#append(C)Ljava/lang/StringBuilder;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#gamma(Ljava/lang/String;)Ljava/lang/String;",
+      "to": "java.lang.StringBuilder#toString()Ljava/lang/String;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#main([Ljava/lang/String;)V",
+      "to": "T#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#main([Ljava/lang/String;)V",
+      "to": "T#alpha(I)I",
+      "resolution": "cha",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#main([Ljava/lang/String;)V",
+      "to": "T#gamma(Ljava/lang/String;)Ljava/lang/String;",
+      "resolution": "cha",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#main([Ljava/lang/String;)V",
+      "to": "java.io.PrintStream#println(Ljava/lang/String;)V",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#main([Ljava/lang/String;)V",
+      "to": "java.lang.StringBuilder#<init>()V",
+      "resolution": "exact",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#main([Ljava/lang/String;)V",
+      "to": "java.lang.StringBuilder#append(I)Ljava/lang/StringBuilder;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#main([Ljava/lang/String;)V",
+      "to": "java.lang.StringBuilder#append(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    },
+    {
+      "from": "T#main([Ljava/lang/String;)V",
+      "to": "java.lang.StringBuilder#toString()Ljava/lang/String;",
+      "resolution": "unresolved",
+      "semantics": "blocking"
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+# =============================================================================
+# The ConfigMap the policy reads at admission time (`context: axcfg`).
+# =============================================================================
+# The Helm chart generates this from values.yaml. This copy exists for the raw
+# `kubectl apply` path.
+#
+# The name and namespace are LOAD-BEARING: files/ax-inject-policy.yaml references
+# `auxin-system/auxin-inject-config` as a literal string, because Kyverno
+# does not allow variables in a context configMap reference. Rename either one and the
+# lookup fails, the variable does not resolve, the mutate rules are skipped, and pods are
+# admitted unmodified. That is fail-open and therefore safe — but silent. If pods stop
+# getting the agent, check this ConfigMap first.
+#
+# Kyverno serves ConfigMap context lookups from an informer cache, so this is not an API
+# round trip on the admission path.
+#
+# >>> NOT APPLIED. No cluster on the build host.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auxin-inject-config
+  namespace: auxin-system
+  labels:
+    app.kubernetes.io/name: auxin-inject
+    app.kubernetes.io/part-of: auxin
+data:
+  # Image carrying /opt/auxin/ax-agent.jar.
+  agentImage: "ghcr.io/auxin/ax-agent:0.1.0"
+  agentImagePullPolicy: "IfNotPresent"
+
+  # CONTRACTS.md §2 — POST /v1/ingest
+  collectorUrl: "http://gt-collector.auxin-system.svc.cluster.local:8080"
+
+  # R10: "refuse" (default) or "warn".
+  cpuGuardMode: "refuse"
+
+  # Tier 2 = boundary-method latency. Off by default; Tier 1 coverage is always on.
+  tier2Enabled: "false"
+
+  # Appended verbatim to JAVA_TOOL_OPTIONS. Every JVM in the container reads it.
+  extraJvmArgs: ""

@@ -1,0 +1,803 @@
+# =============================================================================
+# auxin — Kyverno Java-agent injection policy
+# =============================================================================
+# CANONICAL SOURCE. The Helm chart ships this file verbatim via `.Files.Get`,
+# so there is exactly one copy of the policy. Everything that varies per install
+# is read at admission time from the ConfigMap
+# `auxin-system/auxin-inject-config` (see `context: axcfg` below),
+# NOT from Helm templating — that is why this file contains no `{{ .Values }}`
+# and is parseable as plain YAML by deploy/verify.sh.
+#
+# Requirement trace (deploy/README.md holds the full table):
+#   R1  failurePolicy: Ignore                      -> spec.failurePolicy
+#   R2  never return allowed:false                 -> mutate-only, no validate/deny anywhere
+#   R3  system+kyverno+collector ns excluded   -> every rule's `exclude.resources.namespaces`
+#                                                 (+ deploy/kyverno/kyverno-configmap-webhooks.yaml)
+#   R4  opt-in by POD LABEL, explicit opt-out  -> every rule's `match`/`exclude` selector
+#   R5  webhookTimeoutSeconds: 2                   -> spec.webhookTimeoutSeconds
+#   R6  idempotency: initContainer present AND `-javaagent:` already in JAVA_TOOL_OPTIONS
+#   R7  JAVA_TOOL_OPTIONS: absent->set w/ leading space, literal->APPEND, valueFrom->skip+warn
+#   R8  JAVA_TOOL_OPTIONS only. Never _JAVA_OPTIONS. Never JDK_JAVA_OPTIONS.
+#   R9  startupProbe + liveness timeout/failureThreshold >= 5 + burstable QoS
+#   R10 refuse (or warn) when limits.cpu < 1
+#   R11 initContainer + emptyDir delivers the agent jar
+#
+# VALIDATION.md trace: A9 (Kyverno), A11 (startup CPU -> CFS throttling), C19, C38, C39.
+#
+# >>> EXECUTED. `kyverno apply` evaluates this policy with NO cluster and NO Docker:
+#
+#       cd deploy && kyverno apply helm/auxin-inject/files/ax-inject-policy.yaml \
+#         --resource test/pods.yaml --values-file test/values.yaml -o /tmp/out
+#
+#     deploy/verify.sh runs exactly that and asserts the MUTATED POD SPECS, not the
+#     policy text. Static string checks over this file proved nothing: 133 of them
+#     passed green while the file did not load at all (see the R3/R4 note below).
+# =============================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: auxin-inject
+  labels:
+    app.kubernetes.io/name: auxin-inject
+    app.kubernetes.io/part-of: auxin
+  annotations:
+    policies.kyverno.io/title: Auxin Java agent injection
+    policies.kyverno.io/category: Auxin
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/minversion: 1.13.0
+    policies.kyverno.io/description: >-
+      Mutates opted-in pods to run the Auxin Java agent: an emptyDir volume, an
+      initContainer that copies ax-agent.jar into it, a JAVA_TOOL_OPTIONS entry that is
+      SET (with a leading space) or APPENDED but never duplicated, startup/liveness probe
+      widening, and burstable CPU QoS. Mutate-only: it can never block pod creation.
+spec:
+  # -- R1 ---------------------------------------------------------------------
+  # Kyverno's default is `Fail`. The OpenTelemetry Operator ships `Ignore` on its pod
+  # webhook and that is the correct posture for an *optional observability* mutation:
+  # if the webhook is unreachable, pods must still start.
+  failurePolicy: Ignore
+
+  # -- R5 ---------------------------------------------------------------------
+  # Two seconds. The default (10s) turns a slow/wedged Kyverno into a cluster-wide pod
+  # creation stall that only ends when failurePolicy kicks in.
+  webhookTimeoutSeconds: 2
+
+  # -- R2 ---------------------------------------------------------------------
+  # `admission: true`  -> evaluated at admission.
+  # `background: false`-> never re-evaluated by the background scanner; we do not want
+  #                        this policy touching, or reporting on, pods that already exist.
+  # `mutateExistingOnPolicyUpdate: false` -> updating this policy must never mutate
+  #                        running workloads (that would be a fleet-wide restart).
+  # Every rule below is `mutate`. A Kyverno mutate rule has no code path that returns
+  # allowed:false; the only rule types that deny are `validate` with an Enforce action.
+  # There is deliberately NO validate rule and NO `deny:` block in this file.
+  # The loud warnings live in ax-events-policy.yaml as asynchronous `generate` rules,
+  # which also cannot affect the admission response.
+  admission: true
+  background: false
+  mutateExistingOnPolicyUpdate: false
+
+  # -- R3 / R4 ----------------------------------------------------------------
+  # THERE IS DELIBERATELY NO `spec.webhookConfiguration` BLOCK HERE. Read this before
+  # adding one back.
+  #
+  # This file used to carry:
+  #     spec.webhookConfiguration.namespaceSelector   (exclude system namespaces)
+  #     spec.webhookConfiguration.objectSelector      (opt-in / opt-out pod label)
+  #     spec.webhookConfiguration.matchConditions     (the same, as CEL)
+  # Two of those three are not real. Proof, `kyverno` CLI 1.19.1:
+  #     $ kyverno apply ax-inject-policy.yaml --resource test/pods.yaml -v 6
+  #     failed to parse document (spec.webhookConfiguration.namespaceSelector:
+  #       Invalid value: value provided for unknown field
+  #      spec.webhookConfiguration.objectSelector:
+  #       Invalid value: value provided for unknown field)
+  #     Applying 0 policy rule(s) to 5 resource(s)...
+  # Kyverno's ClusterPolicy schema has exactly one field under `webhookConfiguration`:
+  # `matchConditions`. `namespaceSelector` and `objectSelector` are NOT Kyverno API —
+  # they are MutatingWebhookConfiguration fields — so a real API server silently PRUNES
+  # them (structural-schema pruning) and the policy runs with no selector at all. They
+  # looked like enforcement and were doing nothing.
+  #
+  # Worse, their presence made `kyverno apply` drop the whole file and still print
+  # `pass: 0, fail: 0, error: 0` with exit code 0 — indistinguishable from a clean run.
+  # That is how the JMESPath syntax error in the `merge(...)` calls survived 133 green
+  # static checks. deploy/verify.sh now asserts a NON-ZERO applied-rule count, which is
+  # the check that would have caught it.
+  #
+  # `matchConditions` IS a valid field, but `kyverno apply` AND `kyverno test` 1.19.1
+  # both SEGFAULT on any policy that carries it when run without a cluster:
+  #     panic: runtime error: invalid memory address or nil pointer dereference
+  #     pkg/validation/policy/validate.go:126
+  # Shipping it would make the canonical policy impossible to test offline, which is the
+  # exact failure mode this file just recovered from. Testability of the shipped bytes
+  # wins over a pre-filter.
+  #
+  # WHAT ENFORCES R3 AND R4 NOW (all of it executed and asserted by deploy/verify.sh):
+  #   R4  every rule's `match.any[].resources.selector.matchLabels` requires
+  #       auxin.dev/inject=true, and every rule's `exclude` drops
+  #       auxin.dev/inject-optout=true and auxin.dev/inject=false.
+  #       Engine-side, evaluated by Kyverno itself. test/pods.yaml case-e proves an
+  #       unlabelled pod comes out byte-identical.
+  #   R3  every rule's `exclude.any[].resources.namespaces` lists the five protected
+  #       namespaces. For the API-server-side half, Kyverno's own supported mechanism is
+  #       the `webhooks` key in the kyverno ConfigMap — deploy/kyverno/
+  #       kyverno-configmap-webhooks.yaml, which is cluster-wide for ALL Kyverno
+  #       policies (read the caveat in that file before applying it).
+  #
+  # If you want the API-server-side pre-filter on THIS policy only, and you accept that
+  # `kyverno apply`/`kyverno test` can no longer be run on the file, add:
+  #
+  #   webhookConfiguration:
+  #     matchConditions:
+  #       - name: gt-opt-in-label
+  #         expression: >-
+  #           has(object.metadata.labels) &&
+  #           'auxin.dev/inject' in object.metadata.labels &&
+  #           object.metadata.labels['auxin.dev/inject'] == 'true'
+  #       - name: gt-not-opted-out
+  #         expression: >-
+  #           !has(object.metadata.labels) ||
+  #           !('auxin.dev/inject-optout' in object.metadata.labels) ||
+  #           object.metadata.labels['auxin.dev/inject-optout'] != 'true'
+  #
+  # It is a performance filter, not a safety control: with failurePolicy: Ignore and a
+  # mutate-only policy, a request that reaches Kyverno and is excluded engine-side has
+  # the same outcome as one the API server never sent.
+
+  rules:
+    # =========================================================================
+    # R11 — deliver the agent jar: emptyDir + initContainer
+    # =========================================================================
+    - name: gt-01-agent-volume-and-init
+      match: &gtMatchPod
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+              selector:
+                matchLabels:
+                  auxin.dev/inject: "true"
+      exclude: &gtExcludePod
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                - kyverno
+                - auxin-system
+          - resources:
+              selector:
+                matchLabels:
+                  auxin.dev/inject-optout: "true"
+          - resources:
+              selector:
+                matchLabels:
+                  auxin.dev/inject: "false"
+      context: &gtContext
+        # Install-time configuration. Kyverno serves this from an informer cache, so it
+        # is not an API round trip on the admission path. If the ConfigMap is missing the
+        # variable fails to resolve, the mutate rule is SKIPPED, and the pod is admitted
+        # unmodified — fail-open, by design (see deploy/README.md).
+        - name: axcfg
+          configMap:
+            name: auxin-inject-config
+            namespace: auxin-system
+        # -- R6, half 1: is our initContainer already there? An object can legitimately
+        #    be sent to a webhook more than once (retries, other webhooks re-admitting).
+        - name: gtInitPresent
+          variable:
+            jmesPath: "length(request.object.spec.initContainers[?name=='auxin-agent-init'] || `[]`)"
+            default: 0
+        # -- R7, case 3: JAVA_TOOL_OPTIONS delivered through valueFrom (secretKeyRef /
+        #    configMapKeyRef / fieldRef) CANNOT be read at admission time. Appending is
+        #    then impossible and adding a second entry with the same name would let the
+        #    kubelet's last-wins map resolution silently destroy the app's own value —
+        #    the exact bug in SkyWalking's injector. So: skip the whole pod, warn.
+        - name: gtJtoValueFrom
+          variable:
+            jmesPath: "length(request.object.spec.containers[].env[] | [?name=='JAVA_TOOL_OPTIONS' && valueFrom != null] || `[]`)"
+            default: 0
+        # -- R10: the CPU guard. A11 measured the same app at 2 cores -> 10-15s and at
+        #    0.5 core -> ~40s time-to-healthy, and a real incident at 0.896 cores with
+        #    ~90s pod startup and 5xx. Below 1 CPU we refuse to add transform work.
+        - name: gtCpuLimitCount
+          variable:
+            jmesPath: "length(request.object.spec.containers[?resources.limits.cpu != null] || `[]`)"
+            default: 0
+        #    >>> `parse_quantity` DOES NOT EXIST. This line used to read
+        #        `min(map(&parse_quantity(@), ...))`. `kyverno jp function` lists every
+        #        function Kyverno adds to JMESPath and parse_quantity is not one of them:
+        #          $ kyverno jp query "parse_quantity('2')"
+        #          Error: error evaluating JMESPath expression: unknown function
+        #        An unknown function makes the whole context variable fail, Kyverno
+        #        falls back to `default: 0`, and 0 < 1 — so the R10 guard fired on EVERY
+        #        pod and the product silently injected nothing. A compliant pod with
+        #        limits.cpu: "2" came out annotated `skip-reason: limits.cpu < 1`.
+        #
+        #        The quantity-aware primitive Kyverno really has is arithmetic:
+        #        `divide(<quantity>, '1')` normalises a k8s CPU quantity to a number of
+        #        cores — divide('2','1') -> 2, divide('500m','1') -> 0.5.
+        #        `to_string()` first, because the API server always sends quantities as
+        #        strings but a raw YAML fixture may carry `cpu: 2` as a JSON number, and
+        #        divide(number, string) is a "Types mismatch" error.
+        #
+        #        Do NOT "simplify" this to `min(...resources.limits.cpu)`. JMESPath min()
+        #        over strings is LEXICOGRAPHIC: min(['10','2']) is '10', and
+        #        min(['2','500m']) is '2'. Both answers are wrong by a factor of 4-5.
+        #
+        #    NO CPU LIMIT AT ALL -> INJECT. The filter yields an empty list, min() of an
+        #    empty list is null, `default: 0` makes gtMinCpuLimit 0 — but the guard is
+        #    reached through `gtCpuLimitCount == 0` in the `any` block below, and the
+        #    gt-13 skip annotation requires gtCpuLimitCount > 0, so such a pod is
+        #    injected and NOT annotated as skipped. That is deliberate: no limit means no
+        #    CFS quota, so there is no throttling to protect the pod from.
+        #    test/pods.yaml `case-f-no-cpu-limit` pins this behaviour.
+        - name: gtMinCpuLimit
+          variable:
+            jmesPath: "min(map(&divide(to_string(@), '1'), request.object.spec.containers[?resources.limits.cpu != null].resources.limits.cpu))"
+            # Fail-CLOSED on an expression error: 0 < 1 means "do not inject". That is the
+            # safe direction, but it is silent — which is exactly how this bug survived.
+            # deploy/verify.sh now asserts that case-a IS injected, so a future breakage
+            # of this expression fails the build instead of disabling the product.
+            default: 0
+        # -- default-deny scope (PLAN-v2 C14 / A3-repriced). An agent with no
+        #    ax.include.packages instruments nothing, so injecting it only buys startup
+        #    cost. No annotation => no injection.
+        - name: gtIncludePackages
+          variable:
+            jmesPath: "request.object.metadata.annotations.\"auxin.dev/include-packages\""
+            default: ""
+        - name: gtArtifact
+          variable:
+            jmesPath: "request.object.metadata.annotations.\"auxin.dev/artifact\" || request.object.metadata.labels.\"app.kubernetes.io/name\" || 'unknown'"
+            default: "unknown"
+        - name: gtBuildSha
+          variable:
+            jmesPath: "request.object.metadata.annotations.\"auxin.dev/build-sha\" || 'unknown'"
+            default: "unknown"
+      # NOTE: gt-01 does NOT share the `&gtPreconditions` anchor. The anchor is defined on
+      # gt-02 and deliberately omits the gtInitPresent guard — see the long comment there.
+      preconditions:
+        all:
+          # R6 — idempotency guard, half 1. Only gt-01 carries it: gt-01 is the rule that
+          # CREATES the initContainer, so "the initContainer already exists" is exactly
+          # the condition under which gt-01 has nothing to do.
+          - key: "{{ gtInitPresent }}"
+            operator: Equals
+            value: 0
+          # R7 — valueFrom anywhere in the pod disables injection for the whole pod.
+          - key: "{{ gtJtoValueFrom }}"
+            operator: Equals
+            value: 0
+          # default-deny scope.
+          - key: "{{ gtIncludePackages }}"
+            operator: NotEquals
+            value: ""
+        any:
+          # R10 — pass if the operator chose warn-only mode ...
+          - key: "{{ axcfg.data.cpuGuardMode }}"
+            operator: Equals
+            value: warn
+          # ... or if no container declares a CPU limit (no CFS quota => no throttling) ...
+          - key: "{{ gtCpuLimitCount }}"
+            operator: Equals
+            value: 0
+          # ... or if the smallest declared CPU limit is at least 1 core.
+          - key: "{{ gtMinCpuLimit }}"
+            operator: GreaterThanOrEquals
+            value: 1
+      mutate:
+        # Strategic merge with the list merge keys (`name`) means re-applying this patch
+        # is a no-op rather than a duplicate — R6's structural half.
+        patchStrategicMerge:
+          spec:
+            volumes:
+              - name: auxin-agent
+                emptyDir:
+                  sizeLimit: 64Mi
+            initContainers:
+              - name: auxin-agent-init
+                image: "{{ axcfg.data.agentImage }}"
+                imagePullPolicy: "{{ axcfg.data.agentImagePullPolicy }}"
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    set -eu;
+                    cp /opt/auxin/ax-agent.jar /ax-agent/ax-agent.jar;
+                    chmod 0444 /ax-agent/ax-agent.jar;
+                    ls -l /ax-agent/ax-agent.jar
+                resources:
+                  requests:
+                    cpu: 50m
+                    memory: 32Mi
+                  limits:
+                    # The init container is short-lived and copies one file. Its own limit
+                    # is irrelevant to R10, which is about the APPLICATION container's
+                    # limit during class transformation.
+                    cpu: 500m
+                    memory: 128Mi
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 65532
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  privileged: false
+                  capabilities:
+                    drop:
+                      - ALL
+                  seccompProfile:
+                    type: RuntimeDefault
+                volumeMounts:
+                  - name: auxin-agent
+                    mountPath: /ax-agent
+
+    # =========================================================================
+    # R11 — mount the shared volume into every application container
+    # =========================================================================
+    - name: gt-02-mount-agent-volume
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      # >>> THE SHARED PRECONDITION ANCHOR. It deliberately does NOT contain
+      #     `{{ gtInitPresent }} == 0`, and putting it back breaks the whole product.
+      #
+      #     Kyverno applies mutate rules in order and re-binds `request.object` to the
+      #     resource AS PATCHED BY THE PREVIOUS RULES. gt-01 creates the initContainer
+      #     `auxin-agent-init`; from that moment on gtInitPresent is 1. With the
+      #     guard on every rule, gt-02..gt-14 all evaluated `1 == 0` and were skipped:
+      #     the pod came out with an emptyDir and an initContainer that copies the jar,
+      #     but NO volumeMount on the app container, NO JAVA_TOOL_OPTIONS, NO probe
+      #     widening and NO provenance annotation. A pod that looks instrumented, mounts
+      #     nothing, and runs a JVM that never loads the agent.
+      #     `kyverno apply --detailed-results -t` shows it directly:
+      #       gt-01 Pass / gt-02..gt-14 "preconditions not met".
+      #
+      #     R6 is not weakened. Idempotency is enforced where the duplication would
+      #     actually happen, per rule, against the CURRENT state of the object:
+      #       gt-01  strategic merge keyed on `name` + the gtInitPresent guard
+      #       gt-02  skips containers that already mount auxin-agent
+      #       gt-03  only fires when JAVA_TOOL_OPTIONS is absent
+      #       gt-04  only fires when it is present, literal, and lacks `-javaagent:`
+      #       gt-05..gt-08  max()-based floors — re-applying them is a no-op
+      #       gt-09/gt-10   fire only while the ratio is wrong; they fix it once
+      #       gt-11  writes fixed annotation values
+      #     gt-12/gt-13/gt-14 keep the gtInitPresent guard inline: they annotate a pod as
+      #     NOT injected, which must never happen to a pod that already carries the agent.
+      #     test/pods.yaml `case-g-already-injected` pins the no-op behaviour.
+      preconditions: &gtPreconditions
+        all:
+          # R7 — valueFrom anywhere in the pod disables injection for the whole pod.
+          - key: "{{ gtJtoValueFrom }}"
+            operator: Equals
+            value: 0
+          # default-deny scope.
+          - key: "{{ gtIncludePackages }}"
+            operator: NotEquals
+            value: ""
+        any:
+          # R10 — pass if the operator chose warn-only mode ...
+          - key: "{{ axcfg.data.cpuGuardMode }}"
+            operator: Equals
+            value: warn
+          # ... or if no container declares a CPU limit (no CFS quota => no throttling) ...
+          - key: "{{ gtCpuLimitCount }}"
+            operator: Equals
+            value: 0
+          # ... or if the smallest declared CPU limit is at least 1 core.
+          - key: "{{ gtMinCpuLimit }}"
+            operator: GreaterThanOrEquals
+            value: 1
+      mutate:
+        foreach:
+          # NOTE: `spec.containers` only. We never touch initContainers' env — an
+          # initContainer that happens to be a JVM must not be instrumented, and
+          # JAVA_TOOL_OPTIONS would otherwise leak into it.
+          - list: "request.object.spec.containers"
+            preconditions:
+              all:
+                - key: "{{ length(element.volumeMounts[?name=='auxin-agent'] || `[]`) }}"
+                  operator: Equals
+                  value: 0
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    volumeMounts:
+                      - name: auxin-agent
+                        mountPath: /ax-agent
+                        readOnly: true
+
+    # =========================================================================
+    # R7 case 1 — JAVA_TOOL_OPTIONS ABSENT -> set it, with a LEADING SPACE
+    # =========================================================================
+    # The leading space is not cosmetic: it is what makes a later naive
+    # `JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS-Dx"` style concatenation in an entrypoint
+    # script survive, and it matches the OTel Operator's getDefaultJavaEnvVars().
+    # R8: JAVA_TOOL_OPTIONS is the ONLY variable honoured by JVMs that are not started
+    # through the `java` launcher (Tomcat, Jetty, JBoss, embedded). `JDK_JAVA_OPTIONS` is
+    # launcher-only and invisible to them; `_JAVA_OPTIONS` is undocumented and has the
+    # highest precedence, so it silently stomps the application's own flags.
+    - name: gt-03-java-tool-options-set
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions: *gtPreconditions
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            preconditions:
+              all:
+                - key: "{{ length(element.env[?name=='JAVA_TOOL_OPTIONS'] || `[]`) }}"
+                  operator: Equals
+                  value: 0
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    env:
+                      - name: JAVA_TOOL_OPTIONS
+                        value: " -javaagent:/ax-agent/ax-agent.jar -Dax.collector.url={{ axcfg.data.collectorUrl }} -Dax.include.packages={{ gtIncludePackages }} -Dax.artifact={{ gtArtifact }} -Dax.build.sha={{ gtBuildSha }} -Dax.tier2.enabled={{ axcfg.data.tier2Enabled }} {{ axcfg.data.extraJvmArgs }}"
+                      - name: GT_POD_NAME
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.name
+                      - name: GT_NAMESPACE
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.namespace
+
+    # =========================================================================
+    # R7 case 2 — JAVA_TOOL_OPTIONS PRESENT with a literal value -> APPEND
+    # =========================================================================
+    # JVM TI spec: "Multiple tools may wish to use this feature, so the variable should
+    # not be overwritten, instead, options should be appended."
+    #
+    # This is a strategic-merge patch keyed on `name`, so it REPLACES the existing
+    # JAVA_TOOL_OPTIONS entry with old-value + our flags. It does NOT add a second env
+    # entry with the same name. Duplicate env names are resolved by the kubelet through a
+    # map (last wins), which is how SkyWalking's injector silently discards the
+    # application's own JAVA_TOOL_OPTIONS. Do not reproduce that.
+    - name: gt-04-java-tool-options-append
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions: *gtPreconditions
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            preconditions:
+              all:
+                # present ...
+                - key: "{{ length(element.env[?name=='JAVA_TOOL_OPTIONS'] || `[]`) }}"
+                  operator: GreaterThan
+                  value: 0
+                # ... as a literal value (valueFrom is handled by skipping the pod) ...
+                - key: "{{ length(element.env[?name=='JAVA_TOOL_OPTIONS' && value != null] || `[]`) }}"
+                  operator: GreaterThan
+                  value: 0
+                # ... and not already carrying our agent. R6, half 2: guard on the
+                # `-javaagent:` substring, not just on the initContainer.
+                - key: "{{ contains(element.env[?name=='JAVA_TOOL_OPTIONS'].value | [0] || '', '-javaagent:/ax-agent/ax-agent.jar') }}"
+                  operator: Equals
+                  value: false
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    env:
+                      - name: JAVA_TOOL_OPTIONS
+                        value: "{{ element.env[?name=='JAVA_TOOL_OPTIONS'].value | [0] }} -javaagent:/ax-agent/ax-agent.jar -Dax.collector.url={{ axcfg.data.collectorUrl }} -Dax.include.packages={{ gtIncludePackages }} -Dax.artifact={{ gtArtifact }} -Dax.build.sha={{ gtBuildSha }} -Dax.tier2.enabled={{ axcfg.data.tier2Enabled }} {{ axcfg.data.extraJvmArgs }}"
+                      - name: GT_POD_NAME
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.name
+                      - name: GT_NAMESPACE
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.namespace
+
+    # =========================================================================
+    # R9 — widen an EXISTING startupProbe to the floor (never narrow it)
+    # =========================================================================
+    - name: gt-05-startup-probe-floor
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions: *gtPreconditions
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            preconditions:
+              all:
+                - key: "{{ element.startupProbe || '' }}"
+                  operator: NotEquals
+                  value: ""
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    startupProbe:
+                      # max() => idempotent, and an app that already asked for more keeps it.
+                      # to_number(to_string(x)) is NOT decoration. go-jmespath's max()
+                      # accepts array[number] or array[string] and nothing else, and it
+                      # type-asserts every element to float64. A probe field that arrived
+                      # as an integer fails the assertion:
+                      #   max([element.startupProbe.periodSeconds || `10`, `10`])
+                      #   -> Invalid type for: [2 10], expected: array[number]|array[string]
+                      # on test/pods.yaml case-i-narrow-startup-probe. Round-tripping
+                      # through a string forces float64 on both sides. Remove it and
+                      # `kyverno apply` reports error: 1.
+                      periodSeconds: "{{ max([to_number(to_string(element.startupProbe.periodSeconds || `10`)), `10`]) }}"
+                      failureThreshold: "{{ max([to_number(to_string(element.startupProbe.failureThreshold || `30`)), `30`]) }}"
+                      timeoutSeconds: "{{ max([to_number(to_string(element.startupProbe.timeoutSeconds || `5`)), `5`]) }}"
+
+    # >>> RULE ORDER. Kyverno applies mutate rules in declaration order and feeds each
+    #     rule the resource AS PATCHED BY THE PREVIOUS ONES (the engine calls
+    #     WithNewResource(patchedResource) between rules). The FLOOR rule therefore runs
+    #     BEFORE the two CREATE rules, so the two paths are mutually exclusive:
+    #       * a container that already has a startupProbe -> floored above, and gt-06/07
+    #         then skip because a startupProbe exists;
+    #       * a container that has none -> skipped above, and gt-06/07 create one already
+    #         at the floor values.
+    #     Honest history: with the create rules FIRST, the floor rule re-read a
+    #     startupProbe that JMESPath merge() had produced and max() rejected the numbers
+    #     in it — `Invalid type for: [30 30], expected: array[number] | array[string]`,
+    #     a real `error: 1`. The to_number(to_string(..)) coercion on every max() below
+    #     fixes that independently, so today `kyverno apply` still reports error: 0 with
+    #     the order reversed. Keep this order anyway: it is defence in depth and it stops
+    #     the floor rule from re-patching a probe the policy itself just wrote.
+    # =========================================================================
+    # R9 — startupProbe derived from the liveness handler
+    # =========================================================================
+    # A startupProbe needs a handler (httpGet/tcpSocket/exec/grpc); we cannot invent one.
+    # We copy the container's own livenessProbe handler and override only the timings.
+    # While a startupProbe is pending the kubelet suppresses BOTH liveness and readiness,
+    # which is exactly the protection needed during the transform CPU burn.
+    # Budget: failureThreshold(30) x periodSeconds(10) = 300s of startup grace.
+    - name: gt-06-startup-probe-from-liveness
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions: *gtPreconditions
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            preconditions:
+              all:
+                - key: "{{ element.livenessProbe || '' }}"
+                  operator: NotEquals
+                  value: ""
+                - key: "{{ element.startupProbe || '' }}"
+                  operator: Equals
+                  value: ""
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    startupProbe: "{{ merge(element.livenessProbe, {initialDelaySeconds: `0`, periodSeconds: `10`, failureThreshold: `30`, timeoutSeconds: `5`, successThreshold: `1`}) }}"
+
+    # Same, for containers that have no livenessProbe but do have a readinessProbe.
+    # No liveness means no restart loop, but readiness flapping under CFS throttling still
+    # yields 5xx at startup; the startupProbe gates readiness too.
+    - name: gt-07-startup-probe-from-readiness
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions: *gtPreconditions
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            preconditions:
+              all:
+                - key: "{{ element.livenessProbe || '' }}"
+                  operator: Equals
+                  value: ""
+                - key: "{{ element.readinessProbe || '' }}"
+                  operator: NotEquals
+                  value: ""
+                - key: "{{ element.startupProbe || '' }}"
+                  operator: Equals
+                  value: ""
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    startupProbe: "{{ merge(element.readinessProbe, {initialDelaySeconds: `0`, periodSeconds: `10`, failureThreshold: `30`, timeoutSeconds: `5`, successThreshold: `1`}) }}"
+
+    # =========================================================================
+    # R9 — livenessProbe.timeoutSeconds >= 5 AND failureThreshold >= 5
+    # =========================================================================
+    # >>> This is the single most important field in the whole chart. A11:
+    # "the self-reinforcing kill: the 1-second livenessProbe.timeoutSeconds default.
+    #  Throttled pod misses the 1s probe -> restart -> backlog -> fail again ->
+    #  CrashLoopBackOff, mathematically unlikely to recover."
+    # The k8s defaults are timeoutSeconds=1, failureThreshold=3.
+    - name: gt-08-liveness-probe-floor
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions: *gtPreconditions
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            preconditions:
+              all:
+                - key: "{{ element.livenessProbe || '' }}"
+                  operator: NotEquals
+                  value: ""
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    livenessProbe:
+                      timeoutSeconds: "{{ max([to_number(to_string(element.livenessProbe.timeoutSeconds || `1`)), `5`]) }}"
+                      failureThreshold: "{{ max([to_number(to_string(element.livenessProbe.failureThreshold || `3`)), `5`]) }}"
+
+    # =========================================================================
+    # R9 — burstable QoS: limits.cpu >= 2 x requests.cpu
+    # =========================================================================
+    # A11's "biggest deployment lever" (90s -> 30s). Two cases:
+    #  (a) limits.cpu set, requests.cpu absent -> k8s copies limits into requests and the
+    #      pod becomes GUARANTEED, i.e. it can never burst through the startup spike.
+    #      Halve the request.
+    #  (b) both set but limits < 2 x requests -> raise the limit. Limits are not scheduled
+    #      on, so raising a limit cannot make the pod unschedulable.
+    - name: gt-09-burstable-qos-requests
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions: *gtPreconditions
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            preconditions:
+              all:
+                - key: "{{ divide(to_string(element.resources.limits.cpu || '0'), '1') }}"
+                  operator: GreaterThan
+                  value: 0
+                - key: "{{ divide(to_string(element.resources.requests.cpu || '0'), '1') }}"
+                  operator: Equals
+                  value: 0
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    resources:
+                      requests:
+                        cpu: "{{ divide(to_string(element.resources.limits.cpu), `2`) }}"
+
+    - name: gt-10-burstable-qos-limits
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions: *gtPreconditions
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            preconditions:
+              all:
+                - key: "{{ divide(to_string(element.resources.requests.cpu || '0'), '1') }}"
+                  operator: GreaterThan
+                  value: 0
+                - key: "{{ divide(to_string(element.resources.limits.cpu || '0'), '1') }}"
+                  operator: LessThan
+                  value: "{{ multiply(divide(to_string(element.resources.requests.cpu), '1'), `2`) }}"
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    resources:
+                      limits:
+                        cpu: "{{ multiply(to_string(element.resources.requests.cpu), `2`) }}"
+
+    # =========================================================================
+    # Provenance annotation — what we did, on the object itself
+    # =========================================================================
+    - name: gt-11-annotate-injected
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions: *gtPreconditions
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            annotations:
+              auxin.dev/injected: "true"
+              auxin.dev/agent-jar: /ax-agent/ax-agent.jar
+              auxin.dev/agent-image: "{{ axcfg.data.agentImage }}"
+              auxin.dev/scope: "{{ gtIncludePackages }}"
+              auxin.dev/artifact: "{{ gtArtifact }}"
+              auxin.dev/build-sha: "{{ gtBuildSha }}"
+              auxin.dev/policy: auxin-inject
+
+    # =========================================================================
+    # Skip provenance — R7 valueFrom. Annotate only; inject nothing.
+    # =========================================================================
+    # The matching warning Event is generated asynchronously by ax-events-policy.yaml.
+    # The annotation exists because Events are garbage-collected after ~1h and the first
+    # question anyone asks is "why did this pod not get the agent?".
+    - name: gt-12-annotate-skip-valuefrom
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions:
+        all:
+          - key: "{{ gtInitPresent }}"
+            operator: Equals
+            value: 0
+          - key: "{{ gtJtoValueFrom }}"
+            operator: GreaterThan
+            value: 0
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            annotations:
+              auxin.dev/injected: "false"
+              auxin.dev/skip-reason: >-
+                JAVA_TOOL_OPTIONS is supplied through valueFrom and cannot be read at
+                admission time. Appending is impossible and a second env entry with the
+                same name would be resolved last-wins by the kubelet, destroying the
+                application's own value. Injection skipped for the whole pod.
+
+    # Skip provenance — R10 CPU guard.
+    - name: gt-13-annotate-skip-cpu-guard
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions:
+        all:
+          - key: "{{ gtInitPresent }}"
+            operator: Equals
+            value: 0
+          - key: "{{ axcfg.data.cpuGuardMode }}"
+            operator: NotEquals
+            value: warn
+          - key: "{{ gtCpuLimitCount }}"
+            operator: GreaterThan
+            value: 0
+          - key: "{{ gtMinCpuLimit }}"
+            operator: LessThan
+            value: 1
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            annotations:
+              auxin.dev/injected: "false"
+              auxin.dev/skip-reason: >-
+                limits.cpu < 1 on at least one container. Class transformation at
+                startup under a sub-core CFS quota is the documented CrashLoopBackOff
+                vector (2 cores -> 10-15s time-to-healthy, 0.5 core -> ~40s). Raise the
+                limit to >= 1 (and keep limits >= 2x requests), or set cpuGuardMode=warn
+                in the auxin-inject-config ConfigMap to inject anyway.
+
+    # Skip provenance — default-deny scope.
+    - name: gt-14-annotate-skip-no-scope
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtContext
+      preconditions:
+        all:
+          - key: "{{ gtInitPresent }}"
+            operator: Equals
+            value: 0
+          - key: "{{ gtJtoValueFrom }}"
+            operator: Equals
+            value: 0
+          - key: "{{ gtIncludePackages }}"
+            operator: Equals
+            value: ""
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            annotations:
+              auxin.dev/injected: "false"
+              auxin.dev/skip-reason: >-
+                No auxin.dev/include-packages annotation. Scope is default-deny:
+                an agent with no package scope instruments nothing and would only add
+                startup cost. Set the annotation, e.g.
+                auxin.dev/include-packages: "com.acme.".

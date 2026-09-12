@@ -1,0 +1,25 @@
+# build output
+target/
+out/
+results/
+*.class
+*.jar
+# third-party jars are auto-fetched by the test harnesses, never vendored
+lib/
+**/lib/*.jar
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# test scratch
+felix-cache*/
+**/felix-cache*/
+*.log
+.auxin/
+
+# os
+.DS_Store

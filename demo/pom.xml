@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  auxin-demo — the integration target for gate G5 (3-agent harness).
+
+  Deliberately dependency-free:
+    * no Spring, no test framework, no JSON library;
+    * the HTTP server is com.sun.net.httpserver.HttpServer, which ships with the JDK;
+    * `mvn -o package` therefore builds with nothing but the plugins already in ~/.m2.
+
+  Why that matters: this jar is the thing three java agents (ax-agent, JaCoCo, OTel) get
+  attached to at once. Every framework in the target app is another source of
+  runtime-generated classes ($$Lambda, CGLIB proxies) and another confounder when a probe
+  does not fire. The target should be boring.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.auxin</groupId>
+  <artifactId>auxin-demo</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+  <name>auxin-demo</name>
+  <description>Plain-Java integration target with a known-dead-code ground truth.</description>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- The demo is the *target app*, not the agent: it may use modern bytecode.
+         (ax-agent itself compiles with release=8; that constraint does not apply here.) -->
+    <maven.compiler.release>17</maven.compiler.release>
+    <!-- Every plugin version pinned, because an unpinned version resolves from the
+         network and this build must work offline (`mvn -o package`). -->
+    <v.compiler>3.13.0</v.compiler>
+    <v.jar>3.5.0</v.jar>
+    <v.resources>3.4.0</v.resources>
+    <v.surefire>3.5.4</v.surefire>
+    <v.install>3.1.4</v.install>
+  </properties>
+
+  <build>
+    <finalName>auxin-demo</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>${v.compiler}</version>
+        <configuration>
+          <!-- Keep parameter names and line numbers: the manifest records `line` per
+               method (CONTRACTS.md §1) and a stripped build makes that meaningless. -->
+          <parameters>true</parameters>
+          <debug>true</debug>
+          <debuglevel>lines,vars,source</debuglevel>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-resources-plugin</artifactId>
+        <version>${v.resources}</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>${v.surefire}</version>
+        <configuration>
+          <!-- No tests on purpose. Coverage of this app must come from the traffic
+               driver, not from a test suite: test-driven coverage is exactly the signal
+               this product argues is not evidence of production liveness. -->
+          <skipTests>true</skipTests>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-install-plugin</artifactId>
+        <version>${v.install}</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>${v.jar}</version>
+        <configuration>
+          <archive>
+            <manifest>
+              <mainClass>io.auxin.demo.App</mainClass>
+            </manifest>
+          </archive>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

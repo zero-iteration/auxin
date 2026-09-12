@@ -1,0 +1,199 @@
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-a-no-jto
+  namespace: default
+  labels: { auxin.dev/inject: "true" }
+  annotations: { auxin.dev/include-packages: "com.acme." }
+spec:
+  containers:
+    - name: app
+      image: demo:1
+      resources: { requests: { cpu: "1" }, limits: { cpu: "2" } }
+      livenessProbe: { httpGet: { path: /health, port: 8080 } }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-b-literal-jto
+  namespace: default
+  labels: { auxin.dev/inject: "true" }
+  annotations: { auxin.dev/include-packages: "com.acme." }
+spec:
+  containers:
+    - name: app
+      image: demo:1
+      env:
+        - name: JAVA_TOOL_OPTIONS
+          value: "-Xmx512m"
+      resources: { requests: { cpu: "1" }, limits: { cpu: "2" } }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-c-valuefrom-jto
+  namespace: default
+  labels: { auxin.dev/inject: "true" }
+  annotations: { auxin.dev/include-packages: "com.acme." }
+spec:
+  containers:
+    - name: app
+      image: demo:1
+      env:
+        - name: JAVA_TOOL_OPTIONS
+          valueFrom: { configMapKeyRef: { name: cm, key: jto } }
+      resources: { requests: { cpu: "1" }, limits: { cpu: "2" } }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-d-sub-one-cpu
+  namespace: default
+  labels: { auxin.dev/inject: "true" }
+  annotations: { auxin.dev/include-packages: "com.acme." }
+spec:
+  containers:
+    - name: app
+      image: demo:1
+      resources: { requests: { cpu: "200m" }, limits: { cpu: "500m" } }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-e-not-opted-in
+  namespace: default
+spec:
+  containers:
+    - name: app
+      image: demo:1
+---
+# R10 boundary: opted in, compliant scope, but NO resources block at all.
+# No CPU limit => no CFS quota => nothing to throttle => MUST be injected, and MUST NOT
+# carry a skip-reason. Pins the `gtCpuLimitCount == 0` branch of the R10 guard.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-f-no-cpu-limit
+  namespace: default
+  labels: { auxin.dev/inject: "true" }
+  annotations: { auxin.dev/include-packages: "com.acme." }
+spec:
+  containers:
+    - name: app
+      image: demo:1
+---
+# R6 idempotency: a FULLY injected pod, exactly as this policy would leave it. A webhook
+# can legitimately see the same object twice (retries, another webhook re-admitting).
+# MUST be a no-op: no second initContainer, no second volumeMount, exactly one
+# JAVA_TOOL_OPTIONS entry, exactly one -javaagent:.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-g-already-injected
+  namespace: default
+  labels: { auxin.dev/inject: "true" }
+  annotations:
+    auxin.dev/include-packages: "com.acme."
+    auxin.dev/injected: "true"
+spec:
+  volumes:
+    - name: auxin-agent
+      emptyDir: { sizeLimit: 64Mi }
+  initContainers:
+    - name: auxin-agent-init
+      image: ghcr.io/auxin/ax-agent:0.1.0
+      volumeMounts:
+        - { name: auxin-agent, mountPath: /ax-agent }
+  containers:
+    - name: app
+      image: demo:1
+      env:
+        - name: JAVA_TOOL_OPTIONS
+          value: "-Xmx512m -javaagent:/ax-agent/ax-agent.jar"
+      volumeMounts:
+        - { name: auxin-agent, mountPath: /ax-agent, readOnly: true }
+      resources: { requests: { cpu: "1" }, limits: { cpu: "2" } }
+---
+# R9 floor: an existing startupProbe that is NARROWER than our floor. gt-05 must widen it
+# (period 2 -> 10, failureThreshold 3 -> 30, timeout 1 -> 5) and gt-06/gt-07 must not
+# replace it. Pins the rule ORDER (floor before create).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-i-narrow-startup-probe
+  namespace: default
+  labels: { auxin.dev/inject: "true" }
+  annotations: { auxin.dev/include-packages: "com.acme." }
+spec:
+  containers:
+    - name: app
+      image: demo:1
+      startupProbe:
+        httpGet: { path: /startup, port: 9090 }
+        periodSeconds: 2
+        failureThreshold: 3
+        timeoutSeconds: 1
+      livenessProbe:
+        httpGet: { path: /health, port: 8080 }
+      resources: { requests: { cpu: "1" }, limits: { cpu: "2" } }
+---
+# R4 opt-out: carries the opt-in label AND the explicit opt-out label. MUST be untouched.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-h-opted-out
+  namespace: default
+  labels:
+    auxin.dev/inject: "true"
+    auxin.dev/inject-optout: "true"
+  annotations: { auxin.dev/include-packages: "com.acme." }
+spec:
+  containers:
+    - name: app
+      image: demo:1
+      resources: { requests: { cpu: "1" }, limits: { cpu: "2" } }
+---
+# R9 burstable QoS (a): limits.cpu set, requests.cpu ABSENT. k8s would copy limits into
+# requests and make the pod GUARANTEED — it could never burst through the transform
+# spike. gt-09 must halve it: requests.cpu -> "1".
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-j-guaranteed-qos
+  namespace: default
+  labels: { auxin.dev/inject: "true" }
+  annotations: { auxin.dev/include-packages: "com.acme." }
+spec:
+  containers:
+    - name: app
+      image: demo:1
+      resources: { limits: { cpu: "2" } }
+---
+# R9 burstable QoS (b): limits < 2 x requests. gt-10 must raise limits.cpu -> "2".
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-k-tight-limits
+  namespace: default
+  labels: { auxin.dev/inject: "true" }
+  annotations: { auxin.dev/include-packages: "com.acme." }
+spec:
+  containers:
+    - name: app
+      image: demo:1
+      resources: { requests: { cpu: "1" }, limits: { cpu: "1" } }
+---
+# Default-deny scope: opted in but NO auxin.dev/include-packages annotation.
+# An agent with no package scope instruments nothing. Must be skipped + annotated.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: case-l-no-scope
+  namespace: default
+  labels: { auxin.dev/inject: "true" }
+spec:
+  containers:
+    - name: app
+      image: demo:1
+      resources: { requests: { cpu: "1" }, limits: { cpu: "2" } }

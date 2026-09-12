@@ -1,0 +1,7 @@
+*.egg-info/
+*.pyc
+*.sqlite
+*.sqlite3
+.pytest_cache/
+.venv/
+__pycache__/

@@ -1,0 +1,32 @@
+{{- if .Values.config.createNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.config.namespace }}
+  labels:
+    app.kubernetes.io/part-of: auxin
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  # Fixed name/namespace: files/ax-inject-policy.yaml looks this up by literal string
+  # (Kyverno does not allow variables in a context configMap reference).
+  name: {{ .Values.config.name }}
+  namespace: {{ .Values.config.namespace }}
+  labels:
+    app.kubernetes.io/name: auxin-inject
+    app.kubernetes.io/part-of: auxin
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+  annotations:
+    auxin.dev/consumed-by: "ClusterPolicy/auxin-inject (context: axcfg)"
+data:
+  agentImage: {{ .Values.config.agentImage | quote }}
+  agentImagePullPolicy: {{ .Values.config.agentImagePullPolicy | quote }}
+  collectorUrl: {{ .Values.config.collectorUrl | quote }}
+  cpuGuardMode: {{ .Values.config.cpuGuardMode | quote }}
+  tier2Enabled: {{ .Values.config.tier2Enabled | quote }}
+  extraJvmArgs: {{ .Values.config.extraJvmArgs | quote }}
+{{- if not (has .Values.config.cpuGuardMode (list "refuse" "warn")) }}
+{{- fail "config.cpuGuardMode must be either \"refuse\" or \"warn\"" }}
+{{- end }}

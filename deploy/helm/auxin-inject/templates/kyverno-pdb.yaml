@@ -1,0 +1,25 @@
+{{- if .Values.kyverno.managePodDisruptionBudget }}
+# Fallback only. The supported path is the upstream kyverno chart's own values
+# (deploy/kyverno/kyverno-values.yaml), which sets replicas, the PDB AND pod
+# anti-affinity together. A PDB alone does not give you HA: with replicas=1 a PDB with
+# minAvailable=2 is unsatisfiable and will block every node drain instead.
+# Only enable this if you have already confirmed Kyverno runs >= 2 replicas.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kyverno-admission-controller-gt
+  namespace: {{ .Values.kyverno.namespace }}
+  labels:
+    app.kubernetes.io/name: auxin-inject
+    app.kubernetes.io/part-of: auxin
+  annotations:
+    auxin.dev/why: >-
+      webhookTimeoutSeconds=2 with failurePolicy=Ignore degrades safely, but a Kyverno
+      outage during a node drain means every pod that restarts in that window comes up
+      uninstrumented and is silently missing from coverage.
+spec:
+  minAvailable: {{ .Values.kyverno.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+{{ toYaml .Values.kyverno.admissionControllerLabels | indent 6 }}
+{{- end }}

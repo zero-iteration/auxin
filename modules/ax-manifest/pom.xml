@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>dev.auxin</groupId>
+  <artifactId>ax-manifest</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <name>ax-manifest</name>
+  <description>
+    Shared contract types for the auxin manifest, plus a hand-written zero-dependency
+    JSON reader/writer. ax-agent loads this inside a host application, so this module must
+    never acquire a third-party dependency (no Jackson, no Gson, no SLF4J) and must compile
+    to Java 8 bytecode so it can attach to JDK 8/11/17/21 hosts.
+  </description>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Java 8 bytecode: ax-agent loads this module inside host applications that may still
+         run on JDK 8. TOOLCHAIN.md notes we can only verify this by compiling, not by running. -->
+    <maven.compiler.release>8</maven.compiler.release>
+    <!-- Tests never ship and always run on the local JDK 17, so they may use modern syntax. -->
+    <maven.compiler.testRelease>17</maven.compiler.testRelease>
+    <junit.version>5.10.2</junit.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.4</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.5.0</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>

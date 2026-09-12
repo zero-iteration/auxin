@@ -1,0 +1,65 @@
+# =============================================================================
+# auxin-inject — chart values
+# =============================================================================
+# IMPORTANT: the Kyverno policies in files/ are shipped VERBATIM (`.Files.Get`), never
+# Go-templated. Kyverno's own `{{ }}` variables and Helm's `{{ }}` cannot share a file
+# without unreadable escaping, and a policy that is one mis-escaped brace away from
+# silently not matching is not a policy you want on an admission path.
+#
+# Everything tunable therefore lives in the ConfigMap below and is read by the policy at
+# admission time (`context: axcfg`), from a FIXED namespace + name:
+#     auxin-system/auxin-inject-config
+# Changing `config.namespace` or `config.name` here without editing files/*.yaml breaks
+# the lookup — deploy/verify.sh asserts the two agree.
+# =============================================================================
+
+policies:
+  inject:
+    enabled: true
+  # Asynchronous Warning Events for skipped pods. Generate-only; cannot block admission.
+  events:
+    enabled: true
+  # Raises progressDeadlineSeconds on instrumented Deployments (separate webhook).
+  rollout:
+    enabled: true
+
+config:
+  # Must match the namespace/name referenced by files/ax-inject-policy.yaml.
+  namespace: auxin-system
+  name: auxin-inject-config
+  createNamespace: false
+
+  # Image that carries /opt/auxin/ax-agent.jar. The initContainer copies the jar
+  # into the shared emptyDir; the application container never needs this image.
+  agentImage: ghcr.io/auxin/ax-agent:0.1.0
+  agentImagePullPolicy: IfNotPresent
+
+  # gt-collector ingest endpoint (CONTRACTS.md §2, POST /v1/ingest).
+  collectorUrl: http://gt-collector.auxin-system.svc.cluster.local:8080
+
+  # R10. "refuse" = do not inject when limits.cpu < 1 (default).
+  #      "warn"   = inject anyway, still emit the Warning Event.
+  # There is no "silent" mode on purpose.
+  cpuGuardMode: refuse
+
+  # Tier 2 (boundary-method latency) on/off at injection time. Tier 1 is always on.
+  tier2Enabled: "false"
+
+  # Appended verbatim to JAVA_TOOL_OPTIONS. Keep it small; every JVM in the container
+  # reads this variable (see deploy/RUNBOOK.md).
+  extraJvmArgs: ""
+
+kyverno:
+  # The supported way to make Kyverno HA is the upstream kyverno chart's own values —
+  # see deploy/kyverno/kyverno-values.yaml (replicas >= 2, PDB, pod anti-affinity).
+  # This switch only exists for clusters where Kyverno was installed without a PDB and
+  # you cannot re-run its chart right now. It creates a PDB selecting Kyverno's labels;
+  # it does not and cannot change replica count or anti-affinity.
+  managePodDisruptionBudget: false
+  namespace: kyverno
+  admissionControllerLabels:
+    app.kubernetes.io/component: admission-controller
+    app.kubernetes.io/instance: kyverno
+    app.kubernetes.io/part-of: kyverno
+  podDisruptionBudget:
+    minAvailable: 2

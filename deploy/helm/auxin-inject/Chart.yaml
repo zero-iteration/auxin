@@ -1,0 +1,24 @@
+apiVersion: v2
+name: auxin-inject
+description: >-
+  Kyverno policies that inject the Auxin Java agent into opted-in pods, plus the
+  probe/QoS hardening that keeps a class-transforming agent from turning CFS throttling
+  into CrashLoopBackOff.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.28.0-0"
+keywords:
+  - auxin
+  - kyverno
+  - java
+  - instrumentation
+  - dead-code
+home: https://github.com/auxin/auxin
+annotations:
+  # The chart itself installs no controller. It requires a working Kyverno install.
+  auxin.dev/requires: "kyverno >= 1.13.0"
+  auxin.dev/tested: >-
+    NOT TESTED ON A CLUSTER. The policies ARE executed offline by the kyverno CLI
+    (`deploy/verify.sh` phase 1 asserts the mutated pod specs), but nothing here has been
+    applied to a real API server, and no Helm render has been run. See deploy/README.md.

@@ -1,0 +1,5 @@
+# .auxin/suppress.txt -- CONTRACTS 5 / C46
+# Break-glass and calendar-bound code looks dead by construction.
+
+com.acme.emergency.KillSwitch#*          # break-glass, exercised ~2yr
+com.acme.batch.YearEndClose#*            # only runs in the year-end window

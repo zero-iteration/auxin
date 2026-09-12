@@ -1,0 +1,15 @@
+# Stands in for the auxin-system/auxin-inject-config ConfigMap that the
+# policy reads via `context: axcfg`. `kyverno apply` has no cluster, so every
+# `{{ axcfg.data.<key> }}` reference has to be supplied here or the rule errors out.
+# deploy/verify.sh asserts that this file covers every axcfg key the policy reads.
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Value
+metadata:
+  name: gt-values
+globalValues:
+  axcfg.data.agentImage: "ghcr.io/auxin/ax-agent:0.1.0"
+  axcfg.data.agentImagePullPolicy: "IfNotPresent"
+  axcfg.data.collectorUrl: "http://gt-collector.auxin-system.svc.cluster.local:8080"
+  axcfg.data.cpuGuardMode: "refuse"
+  axcfg.data.tier2Enabled: "false"
+  axcfg.data.extraJvmArgs: ""

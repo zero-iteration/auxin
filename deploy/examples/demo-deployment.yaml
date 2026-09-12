@@ -1,0 +1,119 @@
+# =============================================================================
+# Example: the demo/ target app, opted in to Auxin injection.
+# =============================================================================
+# This is the G5 (3-agent harness) target. It is written the way a REAL application is
+# written — probes and resources declared by the app team, nothing Auxin-specific
+# except the label and two annotations. Everything else in this file is what the mutation
+# is expected to change, so it doubles as the fixture for "what did the policy do".
+#
+# Expected mutations when this pod is admitted:
+#   + spec.volumes[auxin-agent]                       (emptyDir, 64Mi)
+#   + spec.initContainers[auxin-agent-init]
+#   + containers[demo].volumeMounts[auxin-agent]      (/ax-agent, readOnly)
+#   ~ containers[demo].env[JAVA_TOOL_OPTIONS]               APPENDED, not duplicated
+#   + containers[demo].startupProbe                         derived from livenessProbe
+#   ~ containers[demo].livenessProbe.timeoutSeconds  1 -> 5
+#   ~ containers[demo].livenessProbe.failureThreshold 3 -> 5
+#   ~ containers[demo].resources.limits.cpu    1 -> 2       (>= 2x requests)
+#   + metadata.annotations[auxin.dev/injected] = "true"
+#
+# >>> NEVER APPLIED. No cluster on the build host. The list above is the SPECIFICATION
+#     of expected behaviour, not an observation.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auxin-demo
+  namespace: auxin-demo
+  labels:
+    app.kubernetes.io/name: auxin-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: auxin-demo
+  # Left at the default on purpose: ClusterPolicy/auxin-rollout should raise it
+  # to 1200. If it is still 600 after apply, the rollout policy is not matching.
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: auxin-demo
+        # R4 — opt-in is a label, so the API server filters before Kyverno is called.
+        auxin.dev/inject: "true"
+      annotations:
+        # Default-deny scope. Without this, injection is skipped and a Warning Event fires.
+        auxin.dev/include-packages: "io.auxin.demo."
+        auxin.dev/artifact: "auxin-demo"
+        auxin.dev/build-sha: "local-dev"
+    spec:
+      containers:
+        - name: demo
+          image: eclipse-temurin:17-jre
+          command: ["java", "-jar", "/app/auxin-demo.jar", "--seconds=600"]
+          env:
+            # R7 case 2: a literal value that MUST be preserved. If the mutation
+            # overwrites this instead of appending, the demo app loses its own flag —
+            # that is the SkyWalking bug, and this env var is the regression test for it.
+            - name: JAVA_TOOL_OPTIONS
+              value: "-Dax.demo.preexisting=keep-me"
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            # k8s defaults, spelled out so the mutation is visible in a diff.
+            # timeoutSeconds: 1 and failureThreshold: 3 are the CrashLoopBackOff vector.
+            timeoutSeconds: 1
+            failureThreshold: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              # Deliberately equal to requests => Guaranteed QoS, no burst headroom.
+              # gt-10-burstable-qos-limits should raise this to "2".
+              cpu: "1"
+              memory: 512Mi
+---
+# The counter-example: same app, sub-core limit. The CPU guard must REFUSE this pod
+# (annotation auxin.dev/injected=false + Warning Event AuxinCpuGuard) and the
+# pod must still be created and run, uninstrumented.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auxin-demo-tiny
+  namespace: auxin-demo
+  labels:
+    app.kubernetes.io/name: auxin-demo-tiny
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: auxin-demo-tiny
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: auxin-demo-tiny
+        auxin.dev/inject: "true"
+      annotations:
+        auxin.dev/include-packages: "io.auxin.demo."
+    spec:
+      containers:
+        - name: demo
+          image: eclipse-temurin:17-jre
+          command: ["java", "-jar", "/app/auxin-demo.jar", "--seconds=600"]
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m        # < 1 => R10 refusal
+              memory: 256Mi

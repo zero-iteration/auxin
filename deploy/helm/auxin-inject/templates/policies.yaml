@@ -1,0 +1,18 @@
+{{/*
+  The policy bodies are shipped verbatim with .Files.Get — NOT through `tpl`.
+  .Files.Get does not run the Go template engine over the content, which is precisely
+  why Kyverno's own {{ }} expressions inside those files survive intact.
+  Do not "improve" this by switching to `tpl`: it would try to evaluate every Kyverno
+  variable as a Helm variable and render an empty, silently-non-matching policy.
+*/}}
+{{- if .Values.policies.inject.enabled }}
+{{ .Files.Get "files/ax-inject-policy.yaml" }}
+{{- end }}
+{{- if .Values.policies.events.enabled }}
+---
+{{ .Files.Get "files/ax-events-policy.yaml" }}
+{{- end }}
+{{- if .Values.policies.rollout.enabled }}
+---
+{{ .Files.Get "files/ax-rollout-policy.yaml" }}
+{{- end }}

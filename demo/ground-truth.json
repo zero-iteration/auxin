@@ -1,0 +1,144 @@
+{
+  "artifact": "auxin-demo",
+  "version": "0.1.0",
+  "purpose": "Machine-readable ground truth for gate G5. Tests assert against this file.",
+  "howVerified": "demo/verify-auxin.sh — class loading is measured with -Xlog:class+load, execution is measured with the app's own counters, bridges are read out of the class files with javap. Nothing here is asserted by hand-waving.",
+  "runProfile": {
+    "command": "java -jar target/auxin-demo.jar --seconds=10 --min-requests=600 --threads=4",
+    "note": "Every branch keys off a global request index, so the fixture is deterministic under concurrency. --min-requests is what guarantees each rare method runs at least once; a duration-only run on a slow machine could miss them."
+  },
+
+  "neverLoadedClasses": [
+    {
+      "class": "io.auxin.demo.repo.AuditRepository",
+      "why": "No reference anywhere in the application, not even in a constant pool.",
+      "staticallyReachable": false,
+      "expectedVerdict": "UNKNOWN — a class that was never loaded contributes no probe array. Absent is not the same as zero."
+    },
+    {
+      "class": "io.auxin.demo.util.DeadUtils",
+      "why": "No reference anywhere.",
+      "staticallyReachable": false,
+      "expectedVerdict": "UNKNOWN at runtime; DEAD_CANDIDATE only once static analysis corroborates."
+    },
+    {
+      "class": "io.auxin.demo.service.LegacyReportService",
+      "why": "Referenced only from DeadUtils, which is itself never loaded. Two-hop dead subgraph.",
+      "staticallyReachable": true,
+      "expectedVerdict": "UNKNOWN at runtime. The static graph DOES reach it, which is the point: reachability and loading are independent signals."
+    }
+  ],
+
+  "loadedButNeverInvokedClasses": [
+    {
+      "class": "io.auxin.demo.service.MaintenanceWindow",
+      "loadedBy": "Class.forName in App.main",
+      "clinitRuns": true,
+      "methodsInvoked": [],
+      "methodsNeverInvoked": ["<init>()V", "isOpen()Z", "start()V", "stop()V"],
+      "expectedVerdict": "appears in classesLoaded; every declared method probe unset; <clinit> never probed and never nominated. This is a real DEAD_CANDIDATE, unlike the never-loaded classes above. A pipeline that reports the two cases identically is wrong."
+    }
+  ],
+
+  "deadMethods": [
+    {"class": "io.auxin.demo.model.Order", "method": "toLegacyCsv", "desc": "()Ljava/lang/String;",
+     "srcRefs": 2, "staticCheck": true,
+     "note": "Declaration + one call site inside LegacyReportService, which is never loaded. Dead method on a very live class — the case that matters most."},
+    {"class": "io.auxin.demo.model.Order", "method": "toString", "desc": "()Ljava/lang/String;",
+     "srcRefs": null, "staticCheck": false,
+     "note": "An override nobody calls. Excluded from the textual static check because 'toString(' matches unrelated types; verified only by the absence of any call on an Order."},
+    {"class": "io.auxin.demo.model.Customer", "method": "anonymize", "desc": "()Lio/auxin/demo/model/Customer;",
+     "srcRefs": 1, "staticCheck": true},
+    {"class": "io.auxin.demo.repo.OrderRepository", "method": "deleteById", "desc": "(Ljava/lang/String;)Z",
+     "srcRefs": 1, "staticCheck": true},
+    {"class": "io.auxin.demo.repo.OrderRepository", "method": "findByCustomer", "desc": "(Ljava/lang/String;)Ljava/util/List;",
+     "srcRefs": 1, "staticCheck": true},
+    {"class": "io.auxin.demo.repo.CustomerRepository", "method": "purgeInactive", "desc": "(J)I",
+     "srcRefs": 1, "staticCheck": true},
+    {"class": "io.auxin.demo.service.OrderService", "method": "cancelAll", "desc": "()I",
+     "srcRefs": 1, "staticCheck": true, "counter": "dead.cancelAll",
+     "note": "Break-glass method. Listed in demo/.auxin/suppress.txt, so the correct verdict is UNKNOWN, never DEAD_CANDIDATE. A pipeline that nominates this one has failed the suppression test."},
+    {"class": "io.auxin.demo.service.PricingService", "method": "applyLegacyDiscount", "desc": "(I)I",
+     "srcRefs": 1, "staticCheck": true},
+    {"class": "io.auxin.demo.service.ShippingService", "method": "internationalRate", "desc": "(Lio/auxin/demo/model/Order;Ljava/lang/String;)I",
+     "srcRefs": 1, "staticCheck": true},
+    {"class": "io.auxin.demo.service.FraudService", "method": "flagSuspicious", "desc": "(Lio/auxin/demo/model/Order;)V",
+     "srcRefs": 2, "staticCheck": true, "counter": "dead.flagSuspicious",
+     "note": "Declaration + one call site in deepScan behind `score > 90`, which is unreachable because order amounts cap score at 50. Statically reachable in one hop from a method that DOES run; never executed. A call-graph cascade gets this wrong."},
+    {"class": "io.auxin.demo.util.Ids", "method": "shortId", "desc": "()Ljava/lang/String;",
+     "srcRefs": 1, "staticCheck": true},
+    {"class": "io.auxin.demo.http.DemoServer", "method": "describe", "desc": "()Ljava/lang/String;",
+     "srcRefs": 1, "staticCheck": true},
+    {"class": "io.auxin.demo.http.handler.AdminHandler", "method": "dumpThreads", "desc": "()Ljava/lang/String;",
+     "srcRefs": 2, "staticCheck": true, "counter": "dead.dumpThreads",
+     "note": "Declaration + the /admin/threads route in handle(). A wired-up HTTP entry point that is never requested: entry-point enumeration alone would call it live."}
+  ],
+
+  "rareMethods": [
+    {"class": "io.auxin.demo.service.ShippingService", "method": "expressRate", "desc": "(Lio/auxin/demo/model/Order;)I",
+     "trigger": "index % 250 == 0 && index > 0", "counter": "rare.expressRate", "minExpected": 2},
+    {"class": "io.auxin.demo.service.FraudService", "method": "deepScan", "desc": "(Lio/auxin/demo/model/Order;)Z",
+     "trigger": "index % 500 == 0 && index > 0", "counter": "rare.deepScan", "minExpected": 1},
+    {"class": "io.auxin.demo.service.FraudService", "method": "score", "desc": "(Lio/auxin/demo/model/Order;)I",
+     "trigger": "private; reached only through deepScan", "counter": "rare.score", "minExpected": 1},
+    {"class": "io.auxin.demo.service.OrderService", "method": "refund", "desc": "(Lio/auxin/demo/model/Order;Ljava/lang/String;)Lio/auxin/demo/model/Order;",
+     "trigger": "index % 137 == 0 && index > 0 (simulated downstream failure, error path)", "counter": "rare.refund", "minExpected": 4},
+    {"class": "io.auxin.demo.http.handler.AdminHandler", "method": "status", "desc": "()Ljava/lang/String;",
+     "trigger": "GET /admin/status every 200th request", "counter": "rare.adminStatus", "minExpected": 2},
+    {"class": "io.auxin.demo.http.handler.AdminHandler", "method": "rebuildIndex", "desc": "()Ljava/lang/String;",
+     "trigger": "GET /admin/rebuild exactly once, after the load loop", "counter": "rare.adminRebuild", "minExpected": 1,
+     "note": "The guaranteed-once case. Missing this one is a bug, not a sampling artefact."}
+  ],
+
+  "rareBranches": [
+    {"where": "io.auxin.demo.service.OrderService#placeOrder", "branch": "customer == null",
+     "counter": "warmup.createCustomer", "expected": 25,
+     "note": "Warm-up code: live, but only during the first 25 requests. An observation window that starts after warm-up never sees it. Branch-level, so out of scope for tier 1 (method granularity) by design."}
+  ],
+
+  "syntheticOrBridgeMethods": [
+    {"class": "io.auxin.demo.repo.OrderRepository", "method": "save", "desc": "(Ljava/lang/Object;)Ljava/lang/Object;", "kind": "bridge+synthetic"},
+    {"class": "io.auxin.demo.repo.OrderRepository", "method": "findById", "desc": "(Ljava/lang/String;)Ljava/lang/Object;", "kind": "bridge+synthetic"},
+    {"class": "io.auxin.demo.repo.CustomerRepository", "method": "save", "desc": "(Ljava/lang/Object;)Ljava/lang/Object;", "kind": "bridge+synthetic"},
+    {"class": "io.auxin.demo.repo.CustomerRepository", "method": "findById", "desc": "(Ljava/lang/String;)Ljava/lang/Object;", "kind": "bridge+synthetic"},
+    {"class": "io.auxin.demo.service.PricingService", "method": "lambda$quote$0", "desc": "(I)I", "kind": "synthetic"}
+  ],
+  "syntheticRule": "CONTRACTS.md §1: synthetic and bridge methods, <clinit>, abstract and native get NO probe and NO manifest entry. These five are the fixture for that rule. A probe on a bridge is a bug; so is reporting one as dead code.",
+
+  "runtimeGeneratedClasses": {
+    "patterns": ["io.auxin.demo.*$$Lambda$*"],
+    "observed": [
+      "io.auxin.demo.Counters$$Lambda$N",
+      "io.auxin.demo.TrafficDriver$$Lambda$N",
+      "io.auxin.demo.http.DemoServer$$Lambda$N",
+      "io.auxin.demo.service.PricingService$$Lambda$N"
+    ],
+    "rule": "C9: track only classes present in the build manifest; exclude generated-name patterns. These exist so the exclusion has something real to exclude — an app that generates classes indefinitely is how a 188MB exec file became >2GB of heap."
+  },
+
+  "clinit": {
+    "runs": ["io.auxin.demo.service.PricingService", "io.auxin.demo.service.MaintenanceWindow", "io.auxin.demo.util.Ids", "io.auxin.demo.Counters"],
+    "neverRuns": ["io.auxin.demo.repo.AuditRepository"],
+    "rule": "C44: never probe and never nominate a <clinit>. It is the single most-missed method kind in static call graphs."
+  },
+
+  "liveClasses": [
+    "io.auxin.demo.App",
+    "io.auxin.demo.Counters",
+    "io.auxin.demo.TrafficDriver",
+    "io.auxin.demo.http.DemoServer",
+    "io.auxin.demo.http.handler.AdminHandler",
+    "io.auxin.demo.http.handler.HealthHandler",
+    "io.auxin.demo.http.handler.OrderHandler",
+    "io.auxin.demo.model.Customer",
+    "io.auxin.demo.model.Order",
+    "io.auxin.demo.repo.CustomerRepository",
+    "io.auxin.demo.repo.OrderRepository",
+    "io.auxin.demo.repo.Repository",
+    "io.auxin.demo.service.FraudService",
+    "io.auxin.demo.service.OrderService",
+    "io.auxin.demo.service.PricingService",
+    "io.auxin.demo.service.ShippingService",
+    "io.auxin.demo.util.Ids"
+  ]
+}

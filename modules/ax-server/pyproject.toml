@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ax-server"
+version = "0.2.0"
+description = "auxin server side: store, collector, analysis, api, mcp"
+requires-python = ">=3.14"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# Strict: a real warning from our own code must fail the suite. ResourceWarning
+# is ignored only because ThreadingHTTPServer/urllib leave per-connection
+# sockets for the GC to close, which is test-harness noise, not our leak.
+filterwarnings = ["error", "ignore::ResourceWarning"]

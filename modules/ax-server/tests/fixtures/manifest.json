@@ -1,0 +1,156 @@
+{
+  "schemaVersion": 1,
+  "buildSha": "abc123def",
+  "artifact": "checkout-service",
+  "generatedAt": "2026-09-12T10:00:00Z",
+  "classes": [
+    {
+      "name": "com.acme.shipping.RateSelector",
+      "sourceFile": "RateSelector.java",
+      "probeCount": 4,
+      "schemaHash": "5f2a0001",
+      "isPublicApi": false,
+      "methods": [
+        { "idx": 0, "name": "pick", "desc": "(Ljava/util/List;)Lcom/acme/Rate;",
+          "line": 47, "access": "public", "synthetic": false, "tier2": true,
+          "dynamicallyObservable": true, "shortCircuitable": false },
+        { "idx": 1, "name": "normalise", "desc": "(Lcom/acme/Rate;)Lcom/acme/Rate;",
+          "line": 61, "access": "private", "synthetic": false, "tier2": false,
+          "dynamicallyObservable": true, "shortCircuitable": false },
+        { "idx": 2, "name": "legacyFallback", "desc": "()V",
+          "line": 88, "access": "private", "synthetic": false, "tier2": false,
+          "dynamicallyObservable": true, "shortCircuitable": false },
+        { "idx": 3, "name": "cachedLookup", "desc": "(Ljava/lang/String;)Lcom/acme/Rate;",
+          "line": 103, "access": "public", "synthetic": false, "tier2": false,
+          "dynamicallyObservable": true, "shortCircuitable": true }
+      ]
+    },
+    {
+      "name": "com.acme.api.PublicGateway",
+      "sourceFile": "PublicGateway.java",
+      "probeCount": 1,
+      "schemaHash": "5f2a0002",
+      "isPublicApi": true,
+      "methods": [
+        { "idx": 0, "name": "dispatch", "desc": "()V", "line": 12, "access": "public",
+          "synthetic": false, "tier2": false,
+          "dynamicallyObservable": true, "shortCircuitable": false }
+      ]
+    },
+    {
+      "name": "com.acme.emergency.KillSwitch",
+      "sourceFile": "KillSwitch.java",
+      "probeCount": 1,
+      "schemaHash": "5f2a0003",
+      "isPublicApi": false,
+      "methods": [
+        { "idx": 0, "name": "trip", "desc": "()V", "line": 20, "access": "public",
+          "synthetic": false, "tier2": false,
+          "dynamicallyObservable": true, "shortCircuitable": false }
+      ]
+    },
+    {
+      "name": "com.acme.util.Constants",
+      "sourceFile": "Constants.java",
+      "probeCount": 2,
+      "schemaHash": "5f2a0004",
+      "isPublicApi": false,
+      "methods": [
+        { "idx": 0, "name": "maxRetries", "desc": "()I", "line": 7, "access": "public static",
+          "synthetic": false, "tier2": false,
+          "dynamicallyObservable": false, "shortCircuitable": false },
+        { "idx": 1, "name": "<clinit>", "desc": "()V", "line": 5, "access": "static",
+          "synthetic": false, "tier2": false,
+          "dynamicallyObservable": true, "shortCircuitable": false }
+      ]
+    },
+    {
+      "name": "com.acme.shipping.NeverLoaded",
+      "sourceFile": "NeverLoaded.java",
+      "probeCount": 1,
+      "schemaHash": "5f2a0005",
+      "isPublicApi": false,
+      "methods": [
+        { "idx": 0, "name": "run", "desc": "()V", "line": 9, "access": "public",
+          "synthetic": false, "tier2": false,
+          "dynamicallyObservable": true, "shortCircuitable": false }
+      ]
+    },
+    {
+      "name": "com.acme.billing.MonthEndReport",
+      "sourceFile": "MonthEndReport.java",
+      "probeCount": 1,
+      "schemaHash": "5f2a0006",
+      "isPublicApi": false,
+      "methods": [
+        { "idx": 0, "name": "render", "desc": "()V", "line": 31, "access": "public",
+          "synthetic": false, "tier2": false,
+          "dynamicallyObservable": true, "shortCircuitable": false }
+      ]
+    },
+    {
+      "name": "com.acme.lib.LibOnlyUsedByTest",
+      "sourceFile": "LibOnlyUsedByTest.java",
+      "probeCount": 1,
+      "schemaHash": "5f2a0007",
+      "isPublicApi": false,
+      "methods": [
+        { "idx": 0, "name": "helper", "desc": "()V", "line": 14, "access": "public",
+          "synthetic": false, "tier2": false,
+          "dynamicallyObservable": true, "shortCircuitable": false }
+      ]
+    },
+    {
+      "name": "com.acme.lib.LibOnlyUsedByTestTest",
+      "sourceFile": "LibOnlyUsedByTestTest.java",
+      "probeCount": 1,
+      "schemaHash": "5f2a0008",
+      "isPublicApi": false,
+      "isTest": true,
+      "methods": [
+        { "idx": 0, "name": "testHelper", "desc": "()V", "line": 11, "access": "public",
+          "synthetic": false, "tier2": false, "isTest": true,
+          "dynamicallyObservable": true, "shortCircuitable": false }
+      ]
+    }
+  ],
+  "entryPoints": [
+    { "class": "com.acme.shipping.RateSelector", "method": "pick",
+      "desc": "(Ljava/util/List;)Lcom/acme/Rate;", "kind": "RequestMapping" },
+    { "class": "com.acme.lib.LibOnlyUsedByTestTest", "method": "testHelper",
+      "desc": "()V", "kind": "JUnit5Test" }
+  ],
+  "callEdges": [
+    { "from": "com.acme.shipping.RateSelector#pick(Ljava/util/List;)Lcom/acme/Rate;",
+      "to": "com.acme.shipping.RateSelector#normalise(Lcom/acme/Rate;)Lcom/acme/Rate;",
+      "resolution": "exact" },
+    { "from": "com.acme.shipping.RateSelector#legacyFallback()V",
+      "to": "com.acme.shipping.RateSelector#normalise(Lcom/acme/Rate;)Lcom/acme/Rate;",
+      "resolution": "exact" },
+    { "from": "com.acme.shipping.RateSelector#cachedLookup(Ljava/lang/String;)Lcom/acme/Rate;",
+      "to": "com.acme.shipping.RateSelector#normalise(Lcom/acme/Rate;)Lcom/acme/Rate;",
+      "resolution": "exact" },
+    { "from": "com.acme.api.PublicGateway#dispatch()V",
+      "to": "com.acme.shipping.RateSelector#pick(Ljava/util/List;)Lcom/acme/Rate;",
+      "resolution": "exact" },
+    { "from": "com.acme.emergency.KillSwitch#trip()V",
+      "to": "com.acme.shipping.RateSelector#normalise(Lcom/acme/Rate;)Lcom/acme/Rate;",
+      "resolution": "exact" },
+    { "from": "com.acme.shipping.NeverLoaded#run()V",
+      "to": "com.acme.shipping.RateSelector#normalise(Lcom/acme/Rate;)Lcom/acme/Rate;",
+      "resolution": "exact" },
+    { "from": "com.acme.scheduler.Unknown#tick()V",
+      "to": "com.acme.billing.MonthEndReport#render()V",
+      "resolution": "unresolved" },
+    { "from": "com.acme.lib.LibOnlyUsedByTestTest#testHelper()V",
+      "to": "com.acme.lib.LibOnlyUsedByTest#helper()V",
+      "resolution": "exact" }
+  ],
+  "libraryTestSccs": [
+    { "kind": "library-test",
+      "members": [
+        "com.acme.lib.LibOnlyUsedByTest#helper()V",
+        "com.acme.lib.LibOnlyUsedByTestTest#testHelper()V"
+      ] }
+  ]
+}

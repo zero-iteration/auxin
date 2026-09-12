@@ -1,0 +1,206 @@
+# =============================================================================
+# auxin — injection warnings (asynchronous, never blocking)
+# =============================================================================
+# R2 is the reason this is a SEPARATE policy made only of `generate` rules.
+#
+# The obvious way to warn is a `validate` rule in Audit mode. We do not do that,
+# because a validate rule is one field away (`failureAction: Enforce`) from blocking
+# every pod in the cluster, and that field is exactly the kind of thing that gets
+# flipped during an incident. There is no `validate:` and no `deny:` anywhere in
+# deploy/ — deploy/verify.sh asserts it.
+#
+# `generate` rules are executed by Kyverno's BACKGROUND controller after the admission
+# response has already been sent. They have no code path that can change allowed.
+#
+# Trade-off, stated plainly: Events are garbage collected (default ~1h) and can be
+# dropped under API server pressure. They are a human-facing hint, not a data source.
+# The durable record is the `auxin.dev/skip-reason` annotation written by
+# ax-inject-policy.yaml onto the pod itself.
+#
+# RBAC: the background controller needs create/update on v1/Event. See
+# deploy/kyverno/kyverno-rbac-events.yaml.
+#
+# >>> EXECUTED offline by `kyverno apply` — deploy/verify.sh phase 1 runs it against
+#     deploy/test/ and asserts the result. Not applied to a real cluster.
+# =============================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: auxin-inject-warnings
+  labels:
+    app.kubernetes.io/name: auxin-inject
+    app.kubernetes.io/part-of: auxin
+  annotations:
+    policies.kyverno.io/title: Auxin injection warnings
+    policies.kyverno.io/category: Auxin
+    policies.kyverno.io/severity: low
+    policies.kyverno.io/subject: Pod, Event
+    policies.kyverno.io/description: >-
+      Emits Warning Events for pods that opted into Auxin injection but were
+      skipped. Generate-only: it cannot affect the admission decision.
+spec:
+  failurePolicy: Ignore          # R1
+  webhookTimeoutSeconds: 2       # R5
+  admission: true
+  background: false
+  generateExisting: false
+  rules:
+    # -------------------------------------------------------------------------
+    # R7 case 3 — JAVA_TOOL_OPTIONS via valueFrom
+    # -------------------------------------------------------------------------
+    - name: gt-warn-java-tool-options-valuefrom
+      match: &gtMatchPod
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+              selector:
+                matchLabels:
+                  auxin.dev/inject: "true"
+      exclude: &gtExcludePod
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                - kyverno
+                - auxin-system
+          - resources:
+              selector:
+                matchLabels:
+                  auxin.dev/inject-optout: "true"
+      context: &gtWarnContext
+        - name: gtJtoValueFrom
+          variable:
+            jmesPath: "length(request.object.spec.containers[].env[] | [?name=='JAVA_TOOL_OPTIONS' && valueFrom != null] || `[]`)"
+            default: 0
+        - name: gtCpuLimitCount
+          variable:
+            jmesPath: "length(request.object.spec.containers[?resources.limits.cpu != null] || `[]`)"
+            default: 0
+        - name: gtMinCpuLimit
+          variable:
+            jmesPath: "min(map(&divide(to_string(@), '1'), request.object.spec.containers[?resources.limits.cpu != null].resources.limits.cpu))"
+            default: 0
+        - name: gtIncludePackages
+          variable:
+            jmesPath: "request.object.metadata.annotations.\"auxin.dev/include-packages\""
+            default: ""
+      preconditions:
+        all:
+          - key: "{{ gtJtoValueFrom }}"
+            operator: GreaterThan
+            value: 0
+      generate:
+        apiVersion: v1
+        kind: Event
+        name: "gt-skip-valuefrom-{{ request.object.metadata.name }}"
+        namespace: "{{ request.namespace }}"
+        synchronize: false
+        orphanDownstreamOnPolicyDelete: true
+        data:
+          type: Warning
+          reason: AuxinInjectionSkipped
+          action: SkipInjection
+          message: >-
+            Auxin agent NOT injected: JAVA_TOOL_OPTIONS is supplied via valueFrom and
+            cannot be read at admission time. Appending is impossible, and adding a second
+            env entry with the same name would be resolved last-wins by the kubelet and
+            would silently discard the application's own JAVA_TOOL_OPTIONS. Move the value
+            inline, or drop the auxin.dev/inject label.
+          reportingComponent: policy.auxin.dev/inject
+          reportingInstance: kyverno
+          count: 1
+          firstTimestamp: "{{ time_now_utc() }}"
+          lastTimestamp: "{{ time_now_utc() }}"
+          source: &gtWarnSource
+            component: kyverno-auxin
+          involvedObject: &gtWarnInvolved
+            apiVersion: v1
+            kind: Pod
+            name: "{{ request.object.metadata.name }}"
+            namespace: "{{ request.namespace }}"
+            uid: "{{ request.object.metadata.uid }}"
+
+    # -------------------------------------------------------------------------
+    # R10 — limits.cpu < 1
+    # -------------------------------------------------------------------------
+    - name: gt-warn-cpu-limit-below-one
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtWarnContext
+      preconditions:
+        all:
+          - key: "{{ gtCpuLimitCount }}"
+            operator: GreaterThan
+            value: 0
+          - key: "{{ gtMinCpuLimit }}"
+            operator: LessThan
+            value: 1
+      generate:
+        apiVersion: v1
+        kind: Event
+        name: "gt-cpu-guard-{{ request.object.metadata.name }}"
+        namespace: "{{ request.namespace }}"
+        synchronize: false
+        orphanDownstreamOnPolicyDelete: true
+        data:
+          type: Warning
+          reason: AuxinCpuGuard
+          action: SkipInjection
+          message: >-
+            limits.cpu < 1 on at least one container of this pod. Class-transforming
+            agents burn CPU during startup; under a sub-core CFS quota this is the
+            documented CrashLoopBackOff vector (measured: 2 cores -> 10-15s
+            time-to-healthy, 0.5 core -> ~40s; a real incident at 0.896 cores produced
+            ~90s pod startup and 5xx). Injection was refused unless cpuGuardMode=warn.
+            Fix: raise limits.cpu to >= 1 and keep limits.cpu >= 2 x requests.cpu.
+          reportingComponent: policy.auxin.dev/inject
+          reportingInstance: kyverno
+          count: 1
+          firstTimestamp: "{{ time_now_utc() }}"
+          lastTimestamp: "{{ time_now_utc() }}"
+          source: *gtWarnSource
+          involvedObject: *gtWarnInvolved
+
+    # -------------------------------------------------------------------------
+    # default-deny scope — labelled for injection but no package scope
+    # -------------------------------------------------------------------------
+    - name: gt-warn-missing-scope
+      match: *gtMatchPod
+      exclude: *gtExcludePod
+      context: *gtWarnContext
+      preconditions:
+        all:
+          - key: "{{ gtIncludePackages }}"
+            operator: Equals
+            value: ""
+          - key: "{{ gtJtoValueFrom }}"
+            operator: Equals
+            value: 0
+      generate:
+        apiVersion: v1
+        kind: Event
+        name: "gt-no-scope-{{ request.object.metadata.name }}"
+        namespace: "{{ request.namespace }}"
+        synchronize: false
+        orphanDownstreamOnPolicyDelete: true
+        data:
+          type: Warning
+          reason: AuxinNoScope
+          action: SkipInjection
+          message: >-
+            Pod carries auxin.dev/inject=true but no auxin.dev/include-packages
+            annotation. Scope is default-deny: an unscoped agent instruments nothing and
+            buys only startup cost. Package scoping is also the dominant overhead lever
+            (a production JaCoCo deployment scoped with includes= measured 0.03%).
+          reportingComponent: policy.auxin.dev/inject
+          reportingInstance: kyverno
+          count: 1
+          firstTimestamp: "{{ time_now_utc() }}"
+          lastTimestamp: "{{ time_now_utc() }}"
+          source: *gtWarnSource
+          involvedObject: *gtWarnInvolved

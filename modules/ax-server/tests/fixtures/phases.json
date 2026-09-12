@@ -1,0 +1,15 @@
+{
+  "requiredPhases": ["month-end", "quarter-end", "year-end-close"],
+  "minCoverageFraction": 0.9,
+  "recurring": [
+    {"phase": "month-end", "rule": "last-days-of-month", "days": 2},
+    {"phase": "quarter-end", "rule": "last-days-of-quarter", "days": 3},
+    {"phase": "year-end-close", "rule": "last-days-of-year", "days": 5}
+  ],
+  "occurrences": [
+    {"phase": "peak-season", "start": "2026-11-25T00:00:00Z", "end": "2026-12-02T00:00:00Z",
+     "label": "black-friday-2026"},
+    {"phase": "dr-drill", "start": "2026-06-13T09:00:00Z", "end": "2026-06-13T17:00:00Z",
+     "label": "dr-2026-h1"}
+  ]
+}

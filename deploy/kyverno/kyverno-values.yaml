@@ -1,0 +1,94 @@
+# =============================================================================
+# Values for the UPSTREAM kyverno chart (not for auxin-inject).
+#   helm upgrade --install kyverno kyverno/kyverno -n kyverno --create-namespace \
+#     -f deploy/kyverno/kyverno-values.yaml
+#
+# R5: ">= 2 replicas + PodDisruptionBudget + pod anti-affinity".
+#
+# Why this is our problem and not the cluster admin's: our webhook is
+# failurePolicy=Ignore, so a Kyverno outage does not break the cluster — it silently
+# stops instrumenting pods. Every pod that restarts during that window comes up WITHOUT
+# the agent and contributes no coverage. In a dead-code product, missing coverage is not
+# a blank cell, it is a method that looks dead. HA here is a correctness requirement,
+# not an availability nicety.
+#
+# Written against kyverno chart 3.x. Field names have moved between 2.x and 3.x —
+# check `helm show values kyverno/kyverno` for the version you actually install.
+#
+# >>> NOT APPLIED. No helm binary and no cluster on the build host.
+# =============================================================================
+
+admissionController:
+  # >= 2. Three tolerates one node drain plus one failure.
+  replicas: 3
+
+  podDisruptionBudget:
+    enabled: true
+    # With 3 replicas, minAvailable 2 keeps a quorum through a drain.
+    # NOTE: minAvailable >= replicas is unsatisfiable and blocks drains forever.
+    minAvailable: 2
+
+  antiAffinity:
+    enabled: true
+
+  # Hard anti-affinity: never two admission controllers on one node. With 3 replicas this
+  # requires >= 3 schedulable nodes; on a 2-node cluster switch to
+  # preferredDuringSchedulingIgnoredDuringExecution or the third pod stays Pending.
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app.kubernetes.io/component
+              operator: In
+              values:
+                - admission-controller
+        topologyKey: kubernetes.io/hostname
+
+  # Spread across zones where the cluster has them.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: admission-controller
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+      # Deliberately no cpu limit on the admission controller: a CFS-throttled admission
+      # webhook is how a 2s webhookTimeoutSeconds turns into fleet-wide non-injection.
+
+  # Kyverno's own readiness gate; leave the chart defaults unless you have a reason.
+  serviceMonitor:
+    enabled: false
+
+backgroundController:
+  # Required for the `generate` rules in ax-events-policy.yaml (the Warning Events).
+  # Set replicas 2 only if you want faster event emission; it is not on the admission path.
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+reportsController:
+  # We ship no validate rules, so there are no policy reports from Auxin.
+  # Left at chart default; disable it only if nothing else in the cluster needs reports.
+  replicas: 1
+
+cleanupController:
+  replicas: 1
+
+config:
+  # Cluster-wide resource filters. Kyverno ships a long default list that already excludes
+  # kube-system etc. for its own webhooks; our policy repeats the exclusion at both the
+  # webhook and rule level, so do not rely on this alone.
+  #
+  # webhooks: see deploy/kyverno/kyverno-configmap-webhooks.yaml before touching this —
+  # it is CLUSTER-WIDE and affects every Kyverno policy, not just ours.
+  excludeGroups:
+    - system:nodes

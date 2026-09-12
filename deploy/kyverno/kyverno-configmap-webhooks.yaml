@@ -1,0 +1,74 @@
+# =============================================================================
+# THE ONLY API-SERVER-SIDE NAMESPACE FILTER THERE IS — cluster-wide webhook selectors
+# =============================================================================
+# This is not a fallback any more. Kyverno's ClusterPolicy schema has NO per-policy
+# `namespaceSelector` and NO per-policy `objectSelector`: the only key it accepts under
+# `spec.webhookConfiguration` is `matchConditions`. ax-inject-policy.yaml used to set the
+# other two; the API server prunes them and the kyverno CLI drops the whole file. See
+# deploy/test/README.md BUG 3.
+#
+# So R3's API-server-side half lives HERE, and nowhere else. Read the caveat first:
+#
+#   >>> IT IS CLUSTER-WIDE. The `webhooks` key configures the selectors on Kyverno's
+#       shared resource webhooks, i.e. on EVERY Kyverno policy in the cluster. Setting an
+#       objectSelector here that requires auxin.dev/inject=true will stop every other
+#       Kyverno policy in the cluster from ever seeing a pod. That is a security incident,
+#       not a misconfiguration, if anyone is relying on Kyverno for pod security.
+#
+# Therefore:
+#   * If Auxin is the ONLY thing Kyverno does in this cluster: both stanzas are fine.
+#   * Otherwise: apply the namespaceSelector ONLY (it is a safe narrowing for system
+#     namespaces that Kyverno already excludes by default), drop the objectSelector, and
+#     accept that the opt-in label is then enforced engine-side by the rule `match` block
+#     instead of API-server-side. That costs a webhook call per pod creation; it does not
+#     cost correctness.
+#   * There is no "upgrade Kyverno and delete this file" option: per-policy namespace
+#     selectors do not exist in any Kyverno version. The engine-side `exclude` blocks in
+#     the policies cover correctness; this file is about not sending the request at all.
+#
+# >>> NOT APPLIED. No cluster on the build host.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kyverno
+  namespace: kyverno
+  labels:
+    app.kubernetes.io/part-of: auxin
+data:
+  # Namespace exclusions only — the safe half. (R3)
+  webhooks: |
+    [
+      {
+        "namespaceSelector": {
+          "matchExpressions": [
+            {
+              "key": "kubernetes.io/metadata.name",
+              "operator": "NotIn",
+              "values": ["kube-system", "kube-public", "kube-node-lease", "kyverno", "auxin-system"]
+            }
+          ]
+        }
+      }
+    ]
+
+  # The objectSelector half, commented out on purpose. Uncomment ONLY in a cluster where
+  # Auxin is the only Kyverno policy. (R4)
+  #
+  # webhooks: |
+  #   [
+  #     {
+  #       "namespaceSelector": {
+  #         "matchExpressions": [
+  #           {"key": "kubernetes.io/metadata.name", "operator": "NotIn",
+  #            "values": ["kube-system", "kube-public", "kube-node-lease", "kyverno", "auxin-system"]}
+  #         ]
+  #       },
+  #       "objectSelector": {
+  #         "matchExpressions": [
+  #           {"key": "auxin.dev/inject", "operator": "In", "values": ["true"]},
+  #           {"key": "auxin.dev/inject-optout", "operator": "NotIn", "values": ["true"]}
+  #         ]
+  #       }
+  #     }
+  #   ]

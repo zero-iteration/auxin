@@ -1,0 +1,36 @@
+auxin-inject {{ .Chart.Version }} installed.
+
+NOTHING IS INSTRUMENTED YET. Opt-in is per-pod and default-deny.
+
+To instrument a workload, add to the POD TEMPLATE (not the Deployment metadata):
+
+  metadata:
+    labels:
+      auxin.dev/inject: "true"              # API-server-side filter (objectSelector)
+    annotations:
+      auxin.dev/include-packages: "com.acme."   # REQUIRED. No scope => no injection.
+      auxin.dev/artifact: "checkout-service"
+      auxin.dev/build-sha: "abc123def"
+
+To opt a single pod back out without removing the label:
+
+      auxin.dev/inject-optout: "true"
+
+Guards that will refuse to inject, loudly (kubectl describe pod, and a Warning Event):
+  * limits.cpu < 1 on any container        -> cpuGuardMode={{ .Values.config.cpuGuardMode }}
+  * JAVA_TOOL_OPTIONS supplied via valueFrom
+  * no auxin.dev/include-packages annotation
+
+Check what happened:
+  kubectl get pod <pod> -o jsonpath='{.metadata.annotations.auxin\.io/injected}{"\n"}'
+  kubectl get pod <pod> -o jsonpath='{.metadata.annotations.auxin\.io/skip-reason}{"\n"}'
+  kubectl get events --field-selector reason=AuxinInjectionSkipped
+
+Before rolling this out, read:
+  deploy/PREFLIGHT.md   node kernel floor, CFS throttling alert, AOT/JEP-483 check, agent order
+  deploy/RUNBOOK.md     the "Picked up JAVA_TOOL_OPTIONS" line everyone files as a bug
+
+These policies have NOT been applied to a real cluster. They ARE executed offline by the
+kyverno CLI: `deploy/verify.sh` runs `kyverno apply` against deploy/test/ and asserts the
+mutated pod specs. Webhook registration, Event generation and runtime behaviour are still
+unproven — run this on a kind cluster before production.
