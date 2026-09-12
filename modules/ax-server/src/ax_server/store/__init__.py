@@ -20,6 +20,7 @@ from ax_server.store.port import (
     IngestAudit,
     ProbeInstallStore,
     Store,
+    Tier2ErrorStore,
     WindowAttribution,
 )
 from ax_server.store.sqlite_store import SqliteStore
@@ -39,6 +40,7 @@ __all__ = [
     "SqliteStore",
     "Store",
     "StoreError",
+    "Tier2ErrorStore",
     "Tier2Record",
     "Window",
     "WindowAttribution",

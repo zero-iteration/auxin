@@ -44,6 +44,23 @@ public final class DrainThread implements Runnable {
      */
     private static final int EDGE_REAP_CYCLES = 25;
 
+    /**
+     * {@code ax.edges.sample.rate=auto} aims for this many sampled root invocations per flush
+     * window (BUG #26).
+     *
+     * <p>Twenty, because that is the smallest number that is obviously not zero. The tier's
+     * output is a call GRAPH, not a rate: the shape of a request's call tree is the same on the
+     * first sampled trace as on the thousandth, so a handful of traces per window already draws
+     * it, and every extra one is cost for a picture you already have. A development-volume
+     * service gets a graph instead of an empty array; a 10k-rps pod converges to a divisor near
+     * its own throughput instead of paying 10 traces a second for the same edges.
+     */
+    private static final int EDGES_AUTO_TARGET_SAMPLES = 20;
+
+    /** Bounds for the auto divisor. Never 0 (that is not a divisor) and never past 16 bits. */
+    private static final int EDGES_AUTO_MIN_RATE = 1;
+    private static final int EDGES_AUTO_MAX_RATE = 65536;
+
     private final Options options;
     private final Manifest manifest;
     private final Ring ring;
@@ -56,6 +73,22 @@ public final class DrainThread implements Runnable {
     private final Clock clock;
     private final EnvironmentClassification environment;
     private final CoverageSnapshot snapshot = new CoverageSnapshot();
+
+    /**
+     * The window-local exception-class name table (CONTRACTS section 2 v4, BUG #24). One
+     * instance, reset per window, drain thread only.
+     */
+    private final ErrorClassTable errorClasses = new ErrorClassTable();
+
+    /**
+     * Tier-2 calls folded into the window that was just built: the free evidence that boundary
+     * methods really were entered. Used for {@code edgesStarvedOfSamples} and as the root-count
+     * estimate for {@code ax.edges.sample.rate=auto}. Drain thread only.
+     */
+    private long windowBoundaryCalls;
+
+    /** {@code edgesSampledRoots} at the previous flush, for the per-window delta. */
+    private long lastSampledRoots;
 
     /**
      * Classes we believe are de-instrumented. <b>Revocable</b> (G5 section 7): any third party's
@@ -167,6 +200,9 @@ public final class DrainThread implements Runnable {
         aggregator.resetWindow();
         if (edgeAggregator != null) edgeAggregator.resetWindow();
         windowStartMs = w.windowEndMs;
+        // AFTER the window has been serialised, never before: agentHealth.edgesSampleRate must
+        // describe the rate the counts in THIS window were produced under (CONTRACTS section 2).
+        retuneEdgeSampleRate(w);
         return json;
     }
 
@@ -193,6 +229,11 @@ public final class DrainThread implements Runnable {
         }
         w.clockNs = clock.nanosPerCall();
         w.clockDegraded = clock.degraded();
+        // BUG #25. clockDegraded says the clock is slow; this says what that costs, in the
+        // vocabulary CONTRACTS section 2 pins (full|sampled|disabled). Derived from the clock
+        // and not from ax.tier2.enabled: "what the clock allows" and "is the tier armed" are
+        // different facts, and the second one is already visible as an empty tier2[].
+        w.tier2TimingMode = clock.wireMode();
         w.degraded = Health.degraded();
         w.degradedReason = Health.degradedReason();
         w.classesInstrumented = Health.classesInstrumented();
@@ -201,7 +242,11 @@ public final class DrainThread implements Runnable {
         // Call-edge tier (SCOPE-v3). Cumulative counters, exactly like ringDropped and
         // transformFailures; the per-window graph is the edges[] array below.
         w.edgesEnabled = options.edgesEnabled;
-        w.edgesSampleRate = options.edgesSampleRate;
+        // The rate actually in force, which is not the configured one once `auto` has retuned
+        // it. When the tier is off nothing installed a mask, so the configured value is the
+        // honest answer there.
+        w.edgesSampleRate = options.edgesEnabled
+                ? EdgeRuntime.sampleRate() : options.edgesSampleRate;
         w.edgesSampledRoots = Health.edgeRootsSampled();
         w.edgesDropped = Health.edgeRingDropped();
         w.edgesTruncatedDepth = Health.edgesTruncatedDepth();
@@ -273,8 +318,15 @@ public final class DrainThread implements Runnable {
             w.coverage.add(c);
         }
 
+        // One name table for the whole window (CONTRACTS section 2 v4). Reset here, filled by
+        // the records below, and only ids those records actually reference end up in it.
+        errorClasses.reset();
+        long boundaryCalls = 0;
         for (Map.Entry<Integer, Tier2Aggregator.MethodStats> e : aggregator.stats().entrySet()) {
             Tier2Aggregator.MethodStats s = e.getValue();
+            // Counted before any `continue`: this is the evidence that boundary methods were
+            // entered at all, and it must not depend on the record surviving to the wire.
+            boundaryCalls += s.calls;
             if (s.empty()) continue;
             Tier2Registry.Entry reg = Tier2Registry.get(e.getKey().intValue());
             if (reg == null) continue;
@@ -286,12 +338,42 @@ public final class DrainThread implements Runnable {
             t.buckets = s.histogram.trimmed();
             if (s.errorCounts != null) {
                 for (int id = 1; id < s.errorCounts.length; id++) {
-                    if (s.errorCounts[id] != 0) {
-                        t.errorTypes.put(ErrorIds.name(id), Long.valueOf(s.errorCounts[id]));
-                    }
+                    final long n = s.errorCounts[id];
+                    if (n == 0) continue;
+                    t.errorTypes.put(ErrorIds.name(id), Long.valueOf(n));
+                    // BUG #24: the same counts, keyed by a window-local id the reader can
+                    // resolve through errorClasses. ADDED, not put: several global ids fold
+                    // into the 255 overflow bucket and the last one must not erase the rest.
+                    final Integer local = Integer.valueOf(errorClasses.localIdFor(id));
+                    final Long had = t.errorsByClass.get(local);
+                    t.errorsByClass.put(local,
+                            Long.valueOf(had == null ? n : had.longValue() + n));
                 }
             }
             w.tier2.add(t);
+        }
+        // Copied, not aliased: `errorClasses` is reset at the top of the next window and this
+        // payload has to stay valid for the sender and for lastPayload().
+        w.errorClasses = new java.util.LinkedHashMap<Integer, String>(errorClasses.names());
+        windowBoundaryCalls = boundaryCalls;
+
+        // BUG #26. Armed, roots entered, nothing sampled => the empty edges[] is a fact about
+        // the RATE. edgesSampledRoots is cumulative for the JVM, so this latches itself off for
+        // good the moment one root is ever sampled, and boundaryCalls is this window's evidence
+        // that there was something to sample. With tier-2 off there is no such evidence and the
+        // flag stays false: a missed warning is recoverable, a false one destroys trust in it.
+        w.edgesStarvedOfSamples =
+                options.edgesEnabled && w.edgesSampledRoots == 0 && boundaryCalls > 0;
+        if (w.edgesStarvedOfSamples && Health.warnOnce("edgesStarvedOfSamples")) {
+            Log.warn("the call-edge tier is ARMED but has not sampled one root invocation: "
+                    + "ax.edges.sample.rate=" + w.edgesSampleRate + " traces 1 root entry in "
+                    + w.edgesSampleRate + " and this window saw only " + boundaryCalls
+                    + " boundary-method call(s). edges[] is empty because of the RATE, not "
+                    + "because nothing ran, and tierArmed/edgesEnabled=true is telling you the "
+                    + "truth. At development volume set ax.edges.sample.rate=64, or "
+                    + "ax.edges.sample.rate=auto to target ~" + EDGES_AUTO_TARGET_SAMPLES
+                    + " sampled roots per flush window. Reported on the wire as "
+                    + "agentHealth.edgesStarvedOfSamples=true.");
         }
 
         if (edgeAggregator != null) {
@@ -316,6 +398,66 @@ public final class DrainThread implements Runnable {
             });
         }
         return w;
+    }
+
+    /**
+     * {@code ax.edges.sample.rate=auto}: aim for {@link #EDGES_AUTO_TARGET_SAMPLES} sampled root
+     * invocations per flush window instead of a fixed divisor (BUG #26). Drain thread only,
+     * called once per flush, after the window has been serialised.
+     *
+     * <h3>The arithmetic</h3>
+     * <pre>
+     *   rootEntries  = the window's tier-2 call count            (EXACT, and free)
+     *                = sampledRootsDelta * rateInForce           (fallback, tier-2 off)
+     *   targetRate   = rootEntries / EDGES_AUTO_TARGET_SAMPLES   (integer division)
+     *   newRate      = largest power of two <= targetRate, clamped to [1, 65536]
+     * </pre>
+     * Worked: 4096 root entries in the window, target 20 -&gt; 4096/20 = 204 -&gt; 128. The next
+     * window samples 4096/128 = 32 roots. 10 entries -&gt; 10/20 = 0 -&gt; clamped to 1: trace
+     * every root, which is the most 10 entries can yield and still under target. 2,000,000
+     * entries -&gt; 100,000 -&gt; clamped to 65536.
+     *
+     * <p><b>Why the tier-2 call count and not the sample count.</b> It makes this a measurement
+     * rather than a control loop: the estimate does not depend on the divisor it is about to
+     * set, so the rate lands on its final value in ONE window and cannot oscillate. (The
+     * fallback, used only with {@code ax.tier2.enabled=false}, does feed back — it converges
+     * geometrically and is the reason the bounds are enforced on every step and not once.)
+     *
+     * <p><b>Rounded DOWN to a power of two</b>, both because the sampling decision is a bitmask
+     * ({@code (++n & (N-1)) == 0}) and because down is the safe direction: the bug being fixed
+     * is a tier that recorded nothing, so where two divisors bracket the target the one that
+     * samples more is the one to take.
+     *
+     * <p>A window with no evidence at all (no tier-2 calls and no samples — an out-of-band
+     * {@code flushNow()} on an idle JVM) leaves the rate exactly as it was. Retuning to 1 on
+     * the strength of an empty window would arm every root entry in the next one.
+     */
+    private void retuneEdgeSampleRate(WindowPayload w) {
+        if (!options.edgesSampleRateAuto || !options.edgesEnabled) return;
+        final long sampledDelta = w.edgesSampledRoots - lastSampledRoots;
+        lastSampledRoots = w.edgesSampledRoots;
+        final int rateInForce = w.edgesSampleRate < 1 ? 1 : w.edgesSampleRate;
+        final long rootEntries = windowBoundaryCalls > 0
+                ? windowBoundaryCalls
+                : sampledDelta * (long) rateInForce;
+        if (rootEntries <= 0) return;
+
+        long target = rootEntries / EDGES_AUTO_TARGET_SAMPLES;
+        if (target > EDGES_AUTO_MAX_RATE) target = EDGES_AUTO_MAX_RATE;
+        int rate = target < EDGES_AUTO_MIN_RATE
+                ? EDGES_AUTO_MIN_RATE
+                : Integer.highestOneBit((int) target);
+        if (rate < EDGES_AUTO_MIN_RATE) rate = EDGES_AUTO_MIN_RATE;
+        if (rate > EDGES_AUTO_MAX_RATE) rate = EDGES_AUTO_MAX_RATE;
+        if (rate == rateInForce) return;
+
+        EdgeRuntime.setSampleRate(rate);
+        final String why = "ax.edges.sample.rate=auto retuned 1-in-" + rateInForce + " -> 1-in-"
+                + rate + " (" + rootEntries + " root entries in the last window, targeting ~"
+                + EDGES_AUTO_TARGET_SAMPLES + " sampled roots per window). Every window reports "
+                + "the rate its own counts were produced under as agentHealth.edgesSampleRate.";
+        if (Health.warnOnce("edgesAutoRate")) Log.info(why);
+        else Log.debug(why);
     }
 
     /**

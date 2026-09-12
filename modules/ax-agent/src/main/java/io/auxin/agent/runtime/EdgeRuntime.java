@@ -142,6 +142,38 @@ public final class EdgeRuntime {
     public static void disable() { enabled = false; }
 
     /**
+     * Retunes the sampling divisor mid-flight. <b>Drain thread only</b>, and only under
+     * {@code ax.edges.sample.rate=auto} (BUG #26).
+     *
+     * <p><b>Zero added cost on the read side</b>, which is the whole reason this is written the
+     * way it is. {@link #sampleMask} stays a plain field, and the new value is published by
+     * re-writing the volatile {@link #enabled} — exactly the idiom {@link #install} relies on
+     * ("MUST be last: it publishes the four above"). Every reader of {@code sampleMask} is
+     * {@link #onRootEnter}, which has already read {@code enabled} on the same path, so the
+     * release/acquire pair is one that exists anyway. Making the mask volatile would have added
+     * a second volatile read to every boundary-method entry to save an allocation-free store
+     * that happens once a minute.
+     *
+     * <p>Worst case while the store propagates: a thread samples at the previous rate for a few
+     * root entries. Benign by construction — the rate is a frequency, each window reports the
+     * rate that was in force when it was built, and {@code edges[].count} is documented as a
+     * raw count of observations that a reader scales by it.
+     */
+    public static void setSampleRate(int sampleRate) {
+        final int mask = (sampleRate < 1 ? 1 : sampleRate) - 1;
+        if (mask == sampleMask) return;
+        synchronized (LOCK) {
+            sampleMask = mask;
+            final boolean on = enabled;      // volatile read ...
+            enabled = on;                    // ... then volatile write: publishes sampleMask
+            // A concurrent fail() writes `failed` and then `enabled=false`, so the write above
+            // could otherwise resurrect a tier that latched itself off between the two. The
+            // latch must win: it is the one decision in here that is for the life of the JVM.
+            if (failed) enabled = false;
+        }
+    }
+
+    /**
      * Break-glass / verification control: take the same path an unexpected {@code Throwable}
      * would take.
      *

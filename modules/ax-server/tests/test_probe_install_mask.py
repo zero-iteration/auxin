@@ -1011,20 +1011,26 @@ def test_the_canonical_environment_spelling_is_accepted(collector):
     assert window.production is True
 
 
-def test_a_non_production_canonical_label_is_still_refused(collector):
+def test_a_non_production_canonical_label_is_still_refused(strict_collector):
     """The added lookup path is a place to LOOK, never a way to pass: the
-    allowlist and the fail-closed default are untouched."""
+    allowlist and the fail-closed default are untouched.
+
+    Bug #22b changed what "failing the gate" DOES -- store and mark, rather
+    than 403 -- so this test now names the `strict_collector`
+    (`--reject-unclassified`) fixture and keeps every assertion. The default
+    path is pinned in `test_non_production_windows.py`.
+    """
     body = realistic_payload_installed(0)
     del body["jvmClassification"]
     body["agentHealth"]["environment"] = "staging"
     with pytest.raises(IngestRejected) as exc:
-        collector.ingest(body)
+        strict_collector.ingest(body)
     assert exc.value.reason == RejectReason.NOT_PRODUCTION
 
 
-def test_an_unclassified_window_is_still_failed_closed(collector):
+def test_an_unclassified_window_is_still_failed_closed(strict_collector):
     body = realistic_payload_installed(0)
     del body["jvmClassification"]
     with pytest.raises(IngestRejected) as exc:
-        collector.ingest(body)
+        strict_collector.ingest(body)
     assert exc.value.reason == RejectReason.NOT_PRODUCTION

@@ -16,6 +16,18 @@ public final class ErrorIds {
     public static final int NONE = 0;
     public static final int OVERFLOW = 255;
 
+    /**
+     * The name CONTRACTS section 2 v4 pins for the overflow bucket in the per-window
+     * {@code errorClasses} table: {@code "255": "<overflow>"}.
+     *
+     * <p>Deliberately NOT the same string as {@link #name(int)} returns for the same id.
+     * {@code name()} feeds {@code tier2[].errorTypes}, which {@code decode.py} has consumed as
+     * {@code "other"} since it shipped; the v4 table is a new key with its own pinned spelling.
+     * Changing {@code name()} to match would silently rename a key in a field the collector
+     * already reads — the exact seam these bugs keep coming from.
+     */
+    public static final String OVERFLOW_NAME = "<overflow>";
+
     private static final List<String> NAMES = new ArrayList<String>();
 
     static {

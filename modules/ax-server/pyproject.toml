@@ -6,7 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "ax-server"
 version = "0.2.0"
 description = "auxin server side: store, collector, analysis, api, mcp"
-requires-python = ">=3.14"
+# BUG #27: this said ">=3.14", which blocks `pip install` on essentially every
+# current box -- 3.14 shipped weeks ago and no LTS distro or CI image has it.
+# Nothing here needs it: the newest language features in use are `X | None`
+# (3.10), `datetime.UTC` / `enum.StrEnum` (3.11) and `int.bit_count` (3.10).
+# `tests/test_python_compat.py` enforces the floor instead of trusting it.
+requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]

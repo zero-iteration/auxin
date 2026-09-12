@@ -18,23 +18,31 @@ CLS = "com.acme.shipping.RateSelector"
 
 
 # -- part 1: fail-closed production classification ----------------------
+#
+# BUG #22b moved the CONSEQUENCE of failing the gate from "403, no row" to
+# "stored, marked, evidence for nothing". These two tests keep every assertion
+# they had and now name the `strict_collector` fixture, i.e. the
+# `--reject-unclassified` mode that preserves the old behaviour for anyone who
+# wants it. The new default is pinned -- harder -- in
+# `test_non_production_windows.py`, which proves such a window can neither
+# create nor revoke a DEAD_CANDIDATE.
 
-def test_unclassified_jvm_is_rejected(collector):
+def test_unclassified_jvm_is_rejected(strict_collector):
     body = realistic_payload(0)
     del body["jvmClassification"]
     with pytest.raises(IngestRejected) as exc:
-        collector.ingest(body)
+        strict_collector.ingest(body)
     assert exc.value.reason == RejectReason.NOT_PRODUCTION
     assert exc.value.status == 403
-    assert collector.store.coverage(BUILD_SHA, CLS) is None
+    assert strict_collector.store.coverage(BUILD_SHA, CLS) is None
 
 
 @pytest.mark.parametrize("env", ["staging", "ci", "qa", "canary", "dev", ""])
-def test_non_production_environments_are_rejected(collector, env):
+def test_non_production_environments_are_rejected(strict_collector, env):
     body = realistic_payload(0)
     body["jvmClassification"] = {"env": env}
     with pytest.raises(IngestRejected) as exc:
-        collector.ingest(body)
+        strict_collector.ingest(body)
     assert exc.value.reason == RejectReason.NOT_PRODUCTION
 
 

@@ -24,6 +24,7 @@ compared between two coverage engines with **0 disagreements**) — but it is no
 | which branch arms never ran? | no — dropped from the runtime path (see A3) |
 | TPS / error rate / p50-p90-p99 | **yes** — automatically on every detected entry point (controllers, `@Scheduled`, listeners, `main`, SPI), plus a glob allowlist, under an enforced budget |
 | what calls what, at runtime? | **yes, sampled** — decided once per boundary-method entry, so unsampled paths cost zero |
+| does it tell overloads apart? | **yes, and this is the differentiator.** Keys on `(class, name, descriptor)`, so a dead overload is distinguishable from its live sibling. In the field trial it beat the reporter's own grep on three pairs — `getConnector(String)` vs `(Provider)`, 3-arg vs 4-arg, 3-arg vs 2-arg. **A search-based tool structurally cannot do this.** |
 | what calls what, statically? | **yes** — CHA graph, every edge labelled `exact \| cha \| unresolved`, and measured ~61% unsound, so it only ever corroborates |
 | request flow across services | **no.** Needs context propagation, which needs per-request allocation, which forfeits zero-allocation and strippability. Out of scope by choice |
 
@@ -40,6 +41,13 @@ compared between two coverage engines with **0 disagreements**) — but it is no
 
 Calibration: Picnic ran JaCoCo — heavier, branch-level probes — in production Kubernetes at
 **0.03%** overhead with package scoping. Scoping is the dominant lever, not probe cleverness.
+
+## Build vs run — you need JDK 17 to build, not to run against
+
+`ax-agent` targets **Java 8 bytecode** and attaches to a JDK 8+ host (verified on real JDK 8).
+`ax-static` is a **build-time** tool that needs **JDK 17+**, and the manifest it emits is plain
+JSON — so the generator's JDK is independent of the JVM under test. Build with 17, instrument an
+app on 8. `ax-server` is Python **>=3.12**, stdlib only.
 
 ## Layout
 
@@ -91,12 +99,19 @@ Meta measured dead-code removal at **odds ratio 5.2, a 90% decrease in SEV-causi
 the other refactoring practices studied. Separately, ICPC 2011: for **over 70%** of entirely
 unused features, *it surprised the stakeholders that they were not used at all.*
 
-## Not supported
+## Verified hosts, and what is genuinely out
 
-GraalVM native image (**impossible** — no bytecode at runtime). JDK 24+ AOT cache (JEP 483) is
-**mutually exclusive** with any classfile-rewriting agent; Datadog and Dynatrace are already
-blocked by this. OSGi / WildFly / Spring Boot fat jar / JPMS must be **tested and claimed**,
-never assumed.
+**Verified on a real service** (see `docs/FIELD-TRIAL.md`): **Spring Boot 2.2 fat jar**, 690 classes
+/ 7,294 methods, `selfbsm` bridge over `LaunchedURLClassLoader`, armed in **255 ms**, +5-10 s on a
+32 s boot, no steady-state latency impact. Also verified locally: **JDK 8 / 11 / 17 / 21**, JPMS
+named modules, OSGi (Apache Felix, boot delegation off), and child-first classloaders — 1,146
+isolation assertions across three JDKs.
+
+**Out, and not fixable:** GraalVM native image (**impossible** — no bytecode at runtime). JDK 24+
+AOT cache (JEP 483) is **mutually exclusive** with any classfile-rewriting agent; Datadog and
+Dynatrace are blocked by the same rule.
+
+**Still untested:** WildFly / JBoss Modules, Tomcat's `WebappClassLoader`, Equinox.
 
 ## Status
 

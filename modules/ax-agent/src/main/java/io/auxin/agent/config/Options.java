@@ -69,8 +69,24 @@ public final class Options {
      * the decision is {@code (++n & (N-1)) == 0} — one increment and one AND on a per-thread
      * counter, no clock, no random, no atomic. {@code 1} traces every root entry and exists for
      * the smoke suite, which must be deterministic; the production default is 1024.
+     *
+     * <p>When {@link #edgesSampleRateAuto} is set this is only the STARTING rate (still 1024, so
+     * a JVM that never gets to its first flush behaves exactly like the fixed default) and the
+     * drain thread retunes it per window.
      */
     public final int edgesSampleRate;
+
+    /**
+     * {@code ax.edges.sample.rate=auto} (BUG #26): target a sampled-root COUNT per flush window
+     * instead of a fixed divisor. Opt-in — the default stays the fixed 1024 that G6 justified.
+     *
+     * <p>The rate is the whole reason the tier reads as broken in development: 1-in-1024 root
+     * entries needs ~1024 requests through one boundary method before it records a single trace,
+     * so a developer poking at a service by hand gets {@code edges: []} next to
+     * {@code edgesEnabled: true}. A fixed divisor cannot serve both that and a 10k-rps pod; a
+     * target count can. See {@code DrainThread.retuneEdgeSampleRate} for the arithmetic.
+     */
+    public final boolean edgesSampleRateAuto;
 
     /** Frames recorded per sampled root invocation. Past it, nothing is recorded and it is counted. */
     public final int edgesMaxDepth;
@@ -141,6 +157,26 @@ public final class Options {
     public final long startupCpuBudgetMs;
     public final long startupWallBudgetMs;
 
+    /**
+     * C24's timing-mode thresholds, in nanoseconds of measured per-call clock cost — no longer
+     * hardcoded (BUG #25). Above {@link #clockSampledThresholdNs} tier-2 times 1 call in 64;
+     * above {@link #clockDisabledThresholdNs} it stops timing altogether. Calls and errors are
+     * unaffected by either.
+     *
+     * <p>They are configuration because the measurement is architecture-dependent (VALIDATION
+     * A4 / Linux L1-L2: a healthy arm64 host reads 41ns of pure timer granularity against a
+     * 60ns threshold) and because an operator who knows their clocksource should be able to pin
+     * the classification rather than re-litigate it on every boot.
+     */
+    public final long clockSampledThresholdNs;
+    public final long clockDisabledThresholdNs;
+
+    public static final long CLOCK_SAMPLED_THRESHOLD_DEFAULT_NS = 60;
+    public static final long CLOCK_DISABLED_THRESHOLD_DEFAULT_NS = 200;
+
+    /** The production edge sample rate (G6). Also the starting point for {@code =auto}. */
+    public static final int EDGES_SAMPLE_RATE_DEFAULT = 1024;
+
     public final String dumpDir;
     public final int logLevel;
 
@@ -165,7 +201,14 @@ public final class Options {
         // deployment with many threads and long traces sits nearer that figure than the unsampled
         // one. Raise ax.edges.sample.rate, or set ax.edges.enabled=false, if that shows up.
         this.edgesEnabled = bool(a, "edges.enabled", true);
-        this.edgesSampleRate = pow2From(num(a, "edges.sample.rate", 1024), 1, "edges.sample.rate");
+        // ax.edges.sample.rate is a number OR the literal `auto` (BUG #26). Checked as a string
+        // first because num() warns about anything unparseable, and "auto" is not a mistake.
+        final String rawRate = str(a, "edges.sample.rate", "");
+        this.edgesSampleRateAuto = rawRate.equalsIgnoreCase("auto");
+        this.edgesSampleRate = edgesSampleRateAuto
+                ? EDGES_SAMPLE_RATE_DEFAULT
+                : pow2From(num(a, "edges.sample.rate", EDGES_SAMPLE_RATE_DEFAULT), 1,
+                        "edges.sample.rate");
         this.edgesMaxDepth = (int) clamp(num(a, "edges.max.depth", 32), 1, 4096, "edges.max.depth");
         this.edgesMaxPerRoot = (int) clamp(num(a, "edges.max.per.root", 256), 0, 1 << 20,
                 "edges.max.per.root");
@@ -228,6 +271,21 @@ public final class Options {
 
         this.startupCpuBudgetMs = num(a, "startup.cpu.budget.ms", 5000);
         this.startupWallBudgetMs = num(a, "startup.wall.budget.ms", 120000);
+
+        long sampledNs = clamp(num(a, "clock.sampled.threshold.ns",
+                CLOCK_SAMPLED_THRESHOLD_DEFAULT_NS), 0, 1000000, "clock.sampled.threshold.ns");
+        long disabledNs = clamp(num(a, "clock.disabled.threshold.ns",
+                CLOCK_DISABLED_THRESHOLD_DEFAULT_NS), 0, 1000000, "clock.disabled.threshold.ns");
+        if (sampledNs > disabledNs) {
+            // Inverted thresholds would make the "disabled" band unreachable and quietly leave a
+            // 400ns Xen clock timing every call. Say so and keep the stricter of the two.
+            Log.warn("ax.clock.sampled.threshold.ns=" + sampledNs + " is above "
+                    + "ax.clock.disabled.threshold.ns=" + disabledNs + ", which would make the "
+                    + "disabled band unreachable: using " + disabledNs + " for both.");
+            sampledNs = disabledNs;
+        }
+        this.clockSampledThresholdNs = sampledNs;
+        this.clockDisabledThresholdNs = disabledNs;
 
         this.dumpDir = str(a, "dump.dir", "");
     }
@@ -365,6 +423,7 @@ public final class Options {
                 + " strip=" + stripEnabled
                 + " edges=" + edgesEnabled
                 + (edgesEnabled ? " edgesSampleRate=" + edgesSampleRate
+                        + (edgesSampleRateAuto ? "(auto)" : "")
                         + " edgesMaxDepth=" + edgesMaxDepth
                         + " edgesMaxPerRoot=" + edgesMaxPerRoot : "")
                 + " probeMode=" + probeMode

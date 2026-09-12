@@ -47,6 +47,12 @@ public final class Batch {
         sb.append(w.clockNs);
         h = Json.key(sb, h, "clockDegraded");
         sb.append(w.clockDegraded);
+        // BUG #25. clockNs + clockDegraded said the clock was slow; they never said what that
+        // costs. full|sampled|disabled is about the TIMING only -- calls and errors are recorded
+        // exactly in all three modes -- so the difference between "tier-2 is dead on this host"
+        // and "you still get counts" is legible without reading the agent's source.
+        h = Json.key(sb, h, "tier2TimingMode");
+        Json.writeString(sb, w.tier2TimingMode);
         h = Json.key(sb, h, "degraded");
         sb.append(w.degraded);
         h = Json.key(sb, h, "degradedReason");
@@ -96,6 +102,10 @@ public final class Batch {
         sb.append(w.edgeTierFailures);
         h = Json.key(sb, h, "edgeTracesReaped");
         sb.append(w.edgeTracesReaped);
+        // BUG #26: armed, roots entered, nothing sampled. "No edges" is then a fact about
+        // ax.edges.sample.rate, not about the application.
+        h = Json.key(sb, h, "edgesStarvedOfSamples");
+        sb.append(w.edgesStarvedOfSamples);
         sb.append('}');
 
         first = Json.key(sb, first, "classesLoaded");
@@ -126,6 +136,23 @@ public final class Batch {
         }
         sb.append(']');
 
+        // CONTRACTS section 2 v4 (BUG #24): ONE name table per window, resolving every
+        // errorsByClass key below it. Written before tier2 so a streaming reader has the table
+        // before the records that reference it. Keys are JSON strings because JSON has no
+        // integer keys; a reader parses them to int and rejects a non-numeric key.
+        //
+        // Always present, empty when nothing threw: the same choice as edges[], for the same
+        // reason -- an absent key means "this agent does not speak v4", which is a different
+        // fact from "nothing errored in this window" and must not be read as it.
+        first = Json.key(sb, first, "errorClasses");
+        sb.append('{');
+        boolean ec = true;
+        for (Map.Entry<Integer, String> e : w.errorClasses.entrySet()) {
+            ec = Json.key(sb, ec, String.valueOf(e.getKey().intValue()));
+            Json.writeString(sb, e.getValue());
+        }
+        sb.append('}');
+
         first = Json.key(sb, first, "tier2");
         sb.append('[');
         for (int i = 0; i < w.tier2.size(); i++) {
@@ -149,6 +176,19 @@ public final class Batch {
                 sb.append(e.getValue().longValue());
             }
             sb.append('}');
+            // v4. Emitted ONLY when non-empty: an absent key is legal and means "types
+            // unavailable", which a reader must render as that and never as zero types. Ids
+            // resolve in THIS window's errorClasses and nowhere else.
+            if (!t.errorsByClass.isEmpty()) {
+                tf = Json.key(sb, tf, "errorsByClass");
+                sb.append('{');
+                boolean eb = true;
+                for (Map.Entry<Integer, Long> e : t.errorsByClass.entrySet()) {
+                    eb = Json.key(sb, eb, String.valueOf(e.getKey().intValue()));
+                    sb.append(e.getValue().longValue());
+                }
+                sb.append('}');
+            }
             tf = Json.key(sb, tf, "buckets");
             sb.append('[');
             for (int b = 0; b < t.buckets.length; b++) {

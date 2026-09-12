@@ -54,6 +54,18 @@ public final class WindowPayload {
         public long calls;
         public long errors;
         public Map<String, Long> errorTypes = new LinkedHashMap<String, Long>();
+        /**
+         * CONTRACTS section 2 <b>v4</b> (BUG #24): errors of this record broken down by the
+         * window-local id of {@link WindowPayload#errorClasses}, which is the only place the
+         * ids may be resolved.
+         *
+         * <p>Emitted only when non-empty — an absent key is legal and means "types unavailable",
+         * never "zero types". {@code sum(values) <= errors} and the two are NOT reconciled here:
+         * {@code errors} is incremented unconditionally on the application thread, the id table
+         * holds 254 classes and id 255 is the overflow bucket. A reader reports the remainder as
+         * unattributed; an agent that "fixed" the difference would be inventing a class.
+         */
+        public Map<Integer, Long> errorsByClass = new LinkedHashMap<Integer, Long>();
         public long[] buckets = new long[0];   // indexed by log-linear bucket index
         public String bucketScheme = "loglinear-16-v1";
     }
@@ -99,6 +111,18 @@ public final class WindowPayload {
     public long ringDropped;
     public long clockNs;
     public boolean clockDegraded;
+    /**
+     * What the calibrated clock lets tier-2 do in this JVM: {@code full} (every call timed),
+     * {@code sampled} (1 call in 64 timed) or {@code disabled} (nothing timed). BUG #25.
+     *
+     * <p><b>It is only about the timing.</b> {@code Tier2Aggregator} increments {@code calls}
+     * unconditionally and classifies every error whatever the mode, so a {@code disabled} window
+     * still carries exact call and error counts for every boundary method and loses only the
+     * latency buckets. The field exists because the only way to learn that was to read the
+     * agent's source: {@code clockDegraded: true} next to empty {@code buckets} reads as
+     * "tier-2 is dead on this host" when it means "you still get counts".
+     */
+    public String tier2TimingMode = "full";
     public boolean degraded;
     public String degradedReason = "";
     public String environment = "unclassified";
@@ -162,6 +186,22 @@ public final class WindowPayload {
     public long edgeTierFailures;
     /** The drain thread reset a leaked trace gate. Non-zero means a trace was never closed. */
     public long edgeTracesReaped;
+    /**
+     * The edge tier is armed, boundary methods really were entered, and {@code edgesSampledRoots}
+     * is still <b>zero</b> — so {@code edges[]} is empty because of the sample RATE and not
+     * because nothing ran (BUG #26).
+     *
+     * <p>The production default of 1-in-1024 root entries (G6) needs ~1024 requests through one
+     * boundary method before it records a single trace, which a developer poking at a service by
+     * hand will never reach: the feature reads as broken while {@code edgesEnabled: true} says
+     * it is on. This says which of the two it is, in the window itself.
+     *
+     * <p>Evidence that roots were entered is the tier-2 call count for this window — free, on the
+     * drain thread, and not one instruction on any application path. With
+     * {@code ax.tier2.enabled=false} there is no such evidence, so the flag stays false rather
+     * than guessing: a missed warning, never a false one.
+     */
+    public boolean edgesStarvedOfSamples;
 
     /**
      * Every class the transformer was handed inside {@code ax.include.packages}, whether or not
@@ -177,6 +217,21 @@ public final class WindowPayload {
     public List<String> instrumentedClasses = new ArrayList<String>();
     public List<Coverage> coverage = new ArrayList<Coverage>();
     public List<Tier2> tier2 = new ArrayList<Tier2>();
+
+    /**
+     * The window's exception-class name table (CONTRACTS section 2 v4, BUG #24): window-local id
+     * -&gt; class name, resolving every key of every {@link Tier2#errorsByClass}.
+     *
+     * <p><b>Window-local.</b> Id 1 here is unrelated to id 1 in the next window, so a reader
+     * resolves ids inside the window that carried them and stores names. Only ids this window's
+     * records actually reference appear; id 255 is the overflow bucket, named
+     * {@link io.auxin.agent.runtime.ErrorIds#OVERFLOW_NAME}.
+     *
+     * <p>Always emitted, empty when nothing errored — the same reason {@link #edges} is always
+     * emitted: an absent key and an empty table are different facts, and a reader that sees the
+     * key can tell "this agent speaks v4 and nothing threw" from "this agent predates v4".
+     */
+    public Map<Integer, String> errorClasses = new LinkedHashMap<Integer, String>();
     /** Additive, alongside {@link #coverage} and {@link #tier2}. Empty when the tier is off. */
     public List<Edge> edges = new ArrayList<Edge>();
 }

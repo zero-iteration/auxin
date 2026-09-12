@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>auxin &mdash; runtime structure</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============================ top bar ============================ -->
+<header id="topbar">
+  <div class="brand">auxin<span class="brand-sub">runtime structure</span></div>
+
+  <label class="ctl">build
+    <select id="build-select" aria-label="build sha"><option value="">&hellip;</option></select>
+  </label>
+
+  <label class="ctl">search
+    <input id="search" type="search" placeholder="class or method&hellip;" aria-label="search classes and methods" autocomplete="off">
+  </label>
+
+  <label class="ctl chk"><input type="checkbox" id="filter-hide"> hide non-matching</label>
+
+  <div class="ctl statusfilter" role="group" aria-label="status filter">
+    <label class="chk live"><input type="checkbox" data-status="LIVE" checked> LIVE</label>
+    <label class="chk dead"><input type="checkbox" data-status="DEAD_CANDIDATE" checked> DEAD_CANDIDATE</label>
+    <label class="chk unknown"><input type="checkbox" data-status="UNKNOWN" checked> UNKNOWN</label>
+    <label class="chk ndo"><input type="checkbox" data-status="NOT_DYNAMICALLY_OBSERVABLE" checked> NOT_DYN_OBS</label>
+  </div>
+
+  <div class="ctl spacer"></div>
+
+  <div class="ctl btns">
+    <button id="btn-collapse-all" type="button" title="collapse every class">collapse all</button>
+    <button id="btn-expand-all" type="button" title="expand everything">expand all</button>
+    <button id="btn-fit" type="button" title="fit graph to view">fit</button>
+    <button id="btn-zoom-out" type="button" aria-label="zoom out">&minus;</button>
+    <span id="zoom-label" aria-live="off">100%</span>
+    <button id="btn-zoom-in" type="button" aria-label="zoom in">+</button>
+    <button id="btn-reload" type="button" title="re-fetch every route">reload</button>
+  </div>
+</header>
+
+<!-- ==================== permanent caveat strip ===================== -->
+<!-- Not dismissible on purpose. Every chip here is a load-bearing caveat:
+     hiding it would make the UI lie about the strength of its own data. -->
+<div id="caveats" aria-label="data caveats">
+  <span class="cav" id="cav-edges">runtime edges &mdash; <b>loading</b></span>
+  <span class="cav" id="cav-phases">phase coverage &mdash; <b>loading</b></span>
+  <span class="cav" id="cav-windows">windows &mdash; <b>loading</b></span>
+  <span class="cav" id="cav-probes">probe install mask &mdash; <b>loading</b></span>
+  <span class="cav warn" id="cav-static">static graph &mdash; <b>~61% unsound (A5)</b>, over-approximates too; never merged with runtime</span>
+</div>
+
+<!-- global failure banner: shown when the app has NO data at all, so that an
+     empty canvas can never be mistaken for "this build has no code". -->
+<div id="fatal" hidden role="alert"></div>
+
+<main>
+  <!-- =========================== canvas =========================== -->
+  <section id="canvas-wrap" aria-label="package class method graph">
+    <svg id="canvas" xmlns="http://www.w3.org/2000/svg" role="group" aria-label="nested box graph">
+      <defs>
+        <!-- markerUnits="userSpaceOnUse" is deliberate: the default scales the
+             marker by stroke-width, and edge width here encodes observation
+             volume, so a hot edge would grow a comically large arrowhead. -->
+        <marker id="arrow-rt" viewBox="0 0 10 10" refX="9.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-rt"/>
+        </marker>
+        <marker id="arrow-rt-hi" viewBox="0 0 10 10" refX="9.5" refY="5" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-rt-hi"/>
+        </marker>
+        <marker id="arrow-st" viewBox="0 0 10 10" refX="9.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-st"/>
+        </marker>
+        <!-- hatch = "this method's silence is not an observation" -->
+        <pattern id="hatch-silence" width="7" height="7" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+          <line x1="0" y1="0" x2="0" y2="7" stroke="#8b8b8b" stroke-width="2.6" stroke-opacity="0.55"/>
+        </pattern>
+      </defs>
+      <g id="viewport">
+        <g id="layer-pkg"></g>
+        <g id="layer-class"></g>
+        <g id="layer-edges"></g>
+        <g id="layer-method"></g>
+        <g id="layer-highlight"></g>
+      </g>
+    </svg>
+
+    <div id="canvas-empty" class="canvas-note" hidden></div>
+
+    <!-- legend -->
+    <details id="legend" open>
+      <summary>legend &amp; how to read this</summary>
+      <div class="legend-title">status <span class="legend-note">(the four verdict statuses)</span></div>
+      <div class="legend-row"><i class="sw st-LIVE"></i><span>LIVE &mdash; a probe bit was set: it ran</span></div>
+      <div class="legend-row"><i class="sw st-DEAD_CANDIDATE"></i><span>DEAD_CANDIDATE &mdash; proposal for human review</span></div>
+      <div class="legend-row"><i class="sw st-UNKNOWN"></i><span>UNKNOWN &mdash; <b>never seen running</b>, not provably dead</span></div>
+      <div class="legend-row"><i class="sw st-NOT_DYNAMICALLY_OBSERVABLE"></i><span>NOT_DYNAMICALLY_OBSERVABLE &mdash; <b>could never be observed</b> (C51)</span></div>
+      <div class="legend-title">eligibility overlay</div>
+      <div class="legend-row"><i class="sw sw-hatch"></i><span>hatched = <b>silence, not evidence</b>: NO_PROBE_INSTALLED (bug #18) or DE_INSTRUMENTED. Distinct from "never ran".</span></div>
+      <div class="legend-title">edges</div>
+      <div class="legend-row"><svg class="sw-line" viewBox="0 0 34 8"><line x1="1" y1="4" x2="33" y2="4" class="lg-rt"/></svg><span>runtime, <b>sampled</b> &mdash; counts are <code>sampledObservations</code>; presence is evidence, <b>absence is not</b></span></div>
+      <div class="legend-row"><svg class="sw-line" viewBox="0 0 34 8"><line x1="1" y1="4" x2="33" y2="4" class="lg-st"/></svg><span>static (manifest callEdges) &mdash; over-approximate <i>and</i> ~61% unsound. Load from the <b>data sources</b> tab.</span></div>
+      <div class="legend-row legend-foot"><span>click a box to collapse/expand &middot; click a method for detail &middot; drag to pan &middot; wheel to zoom</span></div>
+    </details>
+  </section>
+
+  <!-- ============================= rail ============================ -->
+  <aside id="rail" aria-label="detail">
+    <nav id="tabs" role="tablist">
+      <button role="tab" data-tab="detail" class="on" aria-selected="true">detail</button>
+      <button role="tab" data-tab="dead" aria-selected="false">dead code</button>
+      <button role="tab" data-tab="evidence" aria-selected="false">evidence</button>
+      <button role="tab" data-tab="sources" aria-selected="false">data sources</button>
+    </nav>
+    <div id="tab-detail"   class="tabpane on" role="tabpanel"></div>
+    <div id="tab-dead"     class="tabpane" role="tabpanel"></div>
+    <div id="tab-evidence" class="tabpane" role="tabpanel"></div>
+    <div id="tab-sources"  class="tabpane" role="tabpanel"></div>
+  </aside>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

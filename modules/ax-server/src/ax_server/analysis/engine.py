@@ -43,7 +43,8 @@ from ax_server.analysis.ratelimit import DEFAULT_PROPOSALS_PER_DAY, ProposalRate
 from ax_server.analysis.reachability import compute_reachability, entry_point_kinds
 from ax_server.analysis.rules import MethodFacts, evaluate, first_blocking_reason
 from ax_server.analysis.runtime_edges import RuntimeCallGraph, load_runtime_call_graph
-from ax_server.analysis.suppression import Suppressions
+from ax_server.analysis.suppression import Suppressions, compose_suppressions
+from ax_server.collector.classification import NON_PRODUCTION_MEANING
 from ax_server.store.bitset import is_set
 from ax_server.store.models import Window
 from ax_server.store.port import Store
@@ -63,6 +64,11 @@ class AnalysisConfig:
     phase_calendar: PhaseCalendar = field(default_factory=PhaseCalendar.default)
     min_window_days: int = 0
     proposals_per_day: int = DEFAULT_PROPOSALS_PER_DAY
+    #: BUG #28: ship the compiler/Lombok suppression list by default. Set
+    #: False (`--no-default-suppressions`) to run with the user's file alone.
+    #: The set is always enumerable via `AnalysisEngine.suppressions.listing()`
+    #: -- an invisible filter is the failure mode this flag exists to avoid.
+    default_suppressions: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +90,66 @@ class Evidence:
     @property
     def window_days(self) -> int:
         return self.phase_coverage.window_days
+
+    @property
+    def all_windows(self) -> tuple[Window, ...]:
+        return self.usable_windows + self.excluded_windows
+
+    @property
+    def non_production_windows(self) -> tuple[Window, ...]:
+        """BUG #22b: windows that were STORED and are evidence for nothing.
+
+        Reported as their own bucket rather than inside `excluded_windows`,
+        because "we have no data" and "we have data from a JVM you have not
+        told us is production" are different problems with different fixes,
+        and only the second one is fixed by a CLI flag.
+        """
+        return tuple(w for w in self.all_windows if not w.production)
+
+    @property
+    def non_production_environments(self) -> dict[str, int]:
+        """`label -> window count`, so the fix is visibly one flag away."""
+        out: dict[str, int] = {}
+        for w in self.non_production_windows:
+            out[w.environment] = out.get(w.environment, 0) + 1
+        return dict(sorted(out.items()))
+
+    def evidence_gate_note(self) -> str:
+        """The one-line explanation of what the window counts mean for verdicts.
+
+        A first-time user with an unclassified JVM must be able to read ONE
+        sentence and understand why their data is arriving and not counting.
+        Before bug #22b they got a 403 and no data at all.
+        """
+        if not self.all_windows:
+            return (
+                "No windows have been stored for this build at all. Nothing has reported "
+                "yet, or every ingest was rejected -- check the collector's "
+                "rejectsByReason counters."
+            )
+        if not self.non_production_windows:
+            return (
+                f"All {len(self.all_windows)} stored window(s) are production-classified. "
+                f"{len(self.usable_windows)} are usable as death evidence; the rest were "
+                "excluded as degraded or test-tainted."
+            )
+        labels = ", ".join(
+            f"{label!r} x{count}" for label, count in self.non_production_environments.items()
+        )
+        if not self.usable_windows:
+            return (
+                f"{len(self.non_production_windows)} of {len(self.all_windows)} stored "
+                f"window(s) are NOT production-classified ({labels}) and NO window is "
+                "usable as death evidence, so every verdict here is UNKNOWN and no "
+                "DEAD_CANDIDATE can be produced. Data IS arriving and being stored -- it "
+                "is simply not evidence yet. " + NON_PRODUCTION_MEANING
+            )
+        return (
+            f"{len(self.non_production_windows)} of {len(self.all_windows)} stored "
+            f"window(s) are NOT production-classified ({labels}) and contributed nothing "
+            f"to any verdict; {len(self.usable_windows)} production window(s) did. "
+            + NON_PRODUCTION_MEANING
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +178,22 @@ class AnalysisRun:
             "phasesMissing": list(self.evidence.phase_coverage.missing),
             "usableWindows": len(self.evidence.usable_windows),
             "excludedWindows": len(self.evidence.excluded_windows),
+            # BUG #22b. The run summary is where a first-time user looks after
+            # pointing an agent at the collector, so "your data arrived, here
+            # is why it is not evidence" has to be legible HERE and not only
+            # in a log line nobody reads.
+            "windows": {
+                "stored": len(self.evidence.all_windows),
+                "usableAsDeathEvidence": len(self.evidence.usable_windows),
+                "excluded": len(self.evidence.excluded_windows),
+                "nonProduction": len(self.evidence.non_production_windows),
+                "nonProductionEnvironments": self.evidence.non_production_environments,
+                "degraded": sum(1 for w in self.evidence.all_windows if w.degraded),
+                "testTainted": sum(
+                    1 for w in self.evidence.all_windows if w.test_tainted
+                ),
+                "note": self.evidence.evidence_gate_note(),
+            },
             "runtimeEdges": {
                 "reported": self.evidence.runtime_edges.reported,
                 "tierArmed": self.evidence.runtime_edges.armed,
@@ -170,11 +252,23 @@ class AnalysisEngine:
         self.manifest = manifest
         self.config = config or AnalysisConfig()
         if suppressions is not None:
-            self.suppressions = suppressions
+            user_suppressions = suppressions
         elif self.config.suppression_path is not None:
-            self.suppressions = Suppressions.from_file(self.config.suppression_path)
+            user_suppressions = Suppressions.from_file(self.config.suppression_path)
         else:
-            self.suppressions = Suppressions(())
+            user_suppressions = Suppressions(())
+        # BUG #28: the defaults are layered here, in ONE place, so the CLI, the
+        # MCP server and every test see the same rule set. User rules go first
+        # (first-match-wins), so a user line always wins the attribution and
+        # the defaults can only ever add coverage the user's file did not have.
+        self.suppressions = compose_suppressions(
+            user_suppressions,
+            manifest=manifest,
+            include_defaults=self.config.default_suppressions,
+        )
+        #: What the user actually wrote, kept separate so `--list-suppressions`
+        #: can show the two layers apart.
+        self.user_suppressions = user_suppressions
         self.ledger = ledger or SqliteProposalLedger()
         self.efp = efp or EfpTracker()
         self.limiter = limiter or ProposalRateLimiter(

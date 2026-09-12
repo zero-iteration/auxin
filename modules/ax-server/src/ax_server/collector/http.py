@@ -133,6 +133,26 @@ def make_collector_router(collector: CollectorService) -> Router:
     )
 
 
+class _Server(ThreadingHTTPServer):
+    """`ThreadingHTTPServer` with a listen backlog that survives a real client.
+
+    BUG #31, found by the UI agent while verifying against the live collector: socketserver's
+    default ``request_queue_size`` is **5**. The UI opens a 9-way parallel fan-out on load, so four
+    connections were refused and the UI rendered "not available" -- a **spurious** honest-degradation
+    message, which is the worst possible failure for a surface whose whole job is to distinguish
+    "no data" from "request failed".
+
+    The UI capped its own concurrency at 4 as a stopgap, but that is a client-side workaround for a
+    server-side defect: any client that fans out -- a browser, a dashboard, a script, an agent
+    asking several MCP questions at once -- hits the same wall. 128 is the conventional listen
+    backlog and costs nothing; the kernel caps it at ``somaxconn`` anyway.
+    """
+
+    request_queue_size = 128
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def serve(router: Router, *, host: str = "127.0.0.1", port: int = 8787) -> ThreadingHTTPServer:
     handler = type("BoundJsonHandler", (JsonHandler,), {"router": router})
-    return ThreadingHTTPServer((host, port), handler)
+    return _Server((host, port), handler)

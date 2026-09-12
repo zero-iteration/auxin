@@ -70,6 +70,11 @@ class MethodEntry:
     #: body ever running. "Never invoked" then says nothing about liveness.
     short_circuitable: bool = True
     is_test: bool = False
+    #: BUG #28, additive and OPTIONAL: annotation names on this member. Used
+    #: only to derive default suppressions for `@Generated` output; absent =>
+    #: no annotations known => no rule, which is the safe direction for a
+    #: suppression (nothing is hidden that was not asked to be hidden).
+    annotations: tuple[str, ...] = ()
 
     @property
     def is_clinit(self) -> bool:
@@ -89,6 +94,13 @@ class ClassEntry:
     is_public_api: bool = False
     is_test: bool = False
     methods: tuple[MethodEntry, ...] = ()
+    #: BUG #28, additive and OPTIONAL. `annotations` carries `@Generated` on
+    #: the type; `is_record` / `record_components` identify the accessors javac
+    #: writes for a record, which are indistinguishable from hand-written
+    #: getters by name and descriptor alone. All absent => no default rules.
+    annotations: tuple[str, ...] = ()
+    is_record: bool = False
+    record_components: tuple[str, ...] = ()
 
     @property
     def package(self) -> str:
@@ -188,6 +200,29 @@ def _eligibility(raw: Mapping[str, Any]) -> EligibilityClass:
     return EligibilityClass.OBSERVABLE if bool(flag) else EligibilityClass.NOT_DYNAMICALLY_OBSERVABLE
 
 
+def _names(raw: Any) -> tuple[str, ...]:
+    """An additive optional array of strings. Junk reads as empty, never as an
+    error: a suppression hint is not worth refusing a manifest over, and an
+    empty tuple is the safe direction (no default rule is generated)."""
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return ()
+    return tuple(str(item) for item in raw if isinstance(item, str) and item.strip())
+
+
+def _record_components(raw: Mapping[str, Any]) -> tuple[str, ...]:
+    """`recordComponents` as either `["red","green"]` or `[{"name":"red"}, ...]`."""
+    components = raw.get("recordComponents")
+    if not isinstance(components, Sequence) or isinstance(components, (str, bytes)):
+        return ()
+    out: list[str] = []
+    for item in components:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+        elif isinstance(item, Mapping) and isinstance(item.get("name"), str):
+            out.append(str(item["name"]).strip())
+    return tuple(name for name in out if name)
+
+
 def _method(raw: Mapping[str, Any]) -> MethodEntry:
     if "idx" not in raw:
         raise ManifestError("method entry is missing `idx` (build-time probe index, C7)")
@@ -202,6 +237,7 @@ def _method(raw: Mapping[str, Any]) -> MethodEntry:
         eligibility=_eligibility(raw),
         short_circuitable=_bool(raw.get("shortCircuitable"), True),
         is_test=_bool(raw.get("isTest"), False),
+        annotations=_names(raw.get("annotations")),
     )
 
 
@@ -220,6 +256,9 @@ def _class(raw: Mapping[str, Any]) -> ClassEntry:
         is_public_api=_bool(raw.get("isPublicApi"), False),
         is_test=_bool(raw.get("isTest"), False),
         methods=tuple(_method(m) for m in methods_raw),
+        annotations=_names(raw.get("annotations")),
+        is_record=_bool(raw.get("isRecord"), False),
+        record_components=_record_components(raw),
     )
 
 

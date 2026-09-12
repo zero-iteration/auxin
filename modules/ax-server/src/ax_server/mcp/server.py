@@ -240,6 +240,40 @@ class McpServer:
                 str(a["buildSha"]), limit=int(a.get("limit", 20))
             ),
         )
+        # -- BUG #24: exception classes -------------------------------
+        self._add(
+            "gt_exception_classes",
+            "Top exception CLASS NAMES thrown by this build's tier-2 boundary methods. "
+            "Three numbers that must not be collapsed: `attributed` (errors with a named "
+            "class), `unattributed` (`errors - attributed`, which is LEGAL -- the agent's "
+            "id table holds 254 classes with id 255 as an overflow bucket and `errors` is "
+            "counted unconditionally) and `errors` (the total). Never reconcile the gap by "
+            "assuming a class. `typesAvailable: false` with errors > 0 means the count is "
+            "real and the NAMES are unavailable -- it does NOT mean zero exception types.",
+            {
+                **_BUILD_ARG,
+                "sinceDays": {"type": "integer", "default": 7},
+                "limit": {"type": "integer", "default": 20},
+            },
+            ["buildSha"],
+            lambda a: self.api.exception_classes(
+                str(a["buildSha"]),
+                since_days=int(a.get("sinceDays", 7)),
+                limit=int(a.get("limit", 20)),
+            ),
+        )
+        # -- BUG #28: the default suppression list --------------------
+        self._add(
+            "gt_suppressions",
+            "Every active suppression rule, in match order, with the list it came from "
+            "(`user` = .auxin/suppress.txt, `default` = the shipped compiler/Lombok list). "
+            "Read this when a method you expected to see is reported UNKNOWN with a "
+            "`suppressed:` reason. A suppressed method is never silently omitted, and the "
+            "default list can be turned off entirely with --no-default-suppressions.",
+            {},
+            [],
+            lambda a: self.api.suppressions(),
+        )
         self._add(
             "gt_effective_false_positives",
             "Per-rule-class effective-false-positive rates and self-disable state "

@@ -300,6 +300,26 @@ public class SmokeApp {
         check(tier2[2] > 0, "tier-2 latency buckets are populated (got " + tier2[2] + " non-zero)");
         check(tier2[3] == 1, "tier-2 classified the error as IllegalStateException");
 
+        // BUG #24. The class name existed in the agent (ErrorIds) and the per-class counts
+        // existed in the aggregator (MethodStats.errorCounts), and the wire carried neither in a
+        // form a reader could resolve. CONTRACTS section 2 v4: errorsByClass per record, keyed
+        // by a WINDOW-LOCAL id, resolved through this window's errorClasses and nowhere else.
+        check(tier2[T2_ISE_BY_CLASS] == 1,
+                "the thrown IllegalStateException appears in tier2[].errorsByClass, resolved "
+                        + "through the SAME window's errorClasses (got "
+                        + tier2[T2_ISE_BY_CLASS] + ")");
+        check(tier2[T2_UNRESOLVED_IDS] == 0,
+                "every errorsByClass key is numeric AND present in the errorClasses of the "
+                        + "window that carried it -- ids are window-local, so an id resolved "
+                        + "anywhere else is a reader bug waiting to happen (got "
+                        + tier2[T2_UNRESOLVED_IDS] + " unresolvable)");
+        check(tier2[T2_SUM_OVER_ERRORS] == 0,
+                "sum(errorsByClass) <= errors in every record: `errors` is incremented "
+                        + "unconditionally on the application thread and id 255 is an overflow "
+                        + "bucket, so the two may differ -- but only in that direction, and the "
+                        + "agent never reconciles it by inventing a class (excess: "
+                        + tier2[T2_SUM_OVER_ERRORS] + ")");
+
         edgeTier();
 
         section("wire protocol (CONTRACTS section 2)");
@@ -337,6 +357,12 @@ public class SmokeApp {
         // any version it does not know exactly, so bumping it would drop the coverage too.
         check(Json.asArray(w.get("edges")) != null,
                 "edges array present alongside coverage and tier2 (CONTRACTS section 2)");
+        // v4, and always present for the same reason edges[] is: a v4 agent whose window had no
+        // errors ships an empty table, which a reader must be able to tell from a pre-v4 agent
+        // that cannot say anything at all.
+        check(Json.asObject(w.get("errorClasses")) != null,
+                "errorClasses table present at the top level (CONTRACTS section 2 v4), even "
+                        + "when this window's records reference nothing in it");
         Map<String, Object> covTarget = findCoverage(cov, "smoke.SmokeTarget");
         check(covTarget != null, "coverage entry for smoke.SmokeTarget");
         check(Json.str(covTarget, "schemaHash", "").length() == 64, "coverage carries the schemaHash");
@@ -368,6 +394,24 @@ public class SmokeApp {
         check(health.containsKey("ringDropped"), "ringDropped present");
         check(Json.num(health, "clockNs", -1) >= 0, "clockNs reported");
         check(health.containsKey("clockDegraded"), "clockDegraded present");
+        // BUG #25. clockNs and clockDegraded describe the CLOCK; this describes what tier-2 can
+        // still do with it, in the three values CONTRACTS section 2 pins. The forced-threshold
+        // runs in run-negative.sh assert each value, and that calls and errors survive all of
+        // them; here it only has to be present and legal in every shipped configuration.
+        final String timingMode = Json.str(health, "tier2TimingMode", "");
+        check("full".equals(timingMode) || "sampled".equals(timingMode)
+                        || "disabled".equals(timingMode),
+                "agentHealth.tier2TimingMode is one of full|sampled|disabled (got '"
+                        + timingMode + "')");
+        check(Boolean.FALSE.equals(health.get("clockDegraded")) == !"disabled".equals(timingMode),
+                "tier2TimingMode agrees with clockDegraded (degraded iff timing is disabled)");
+        // BUG #26. Either the tier is off, or it has sampled something by now: both edge runs
+        // drive roots through it before this point. An armed tier that has sampled NOTHING
+        // while boundary methods ran is the development-volume trap, and it is asserted
+        // positively in run-negative.sh.
+        check(Boolean.FALSE.equals(health.get("edgesStarvedOfSamples")),
+                "edgesStarvedOfSamples == false (the tier is either off or has sampled a root; "
+                        + "an empty edges[] in this window is not being blamed on the rate)");
         check(Boolean.FALSE.equals(health.get("degraded")), "window is not degraded");
         check(Boolean.FALSE.equals(health.get("scopeMatchedNothing")),
                 "scopeMatchedNothing == false (G5-BUG-1: 'configured to work and did none' is "
@@ -410,6 +454,94 @@ public class SmokeApp {
         check(HEADERS.contains("application/json"), "Content-Type: application/json");
         Map<String, Object> received = Json.asObject(Json.parse(BODIES.get(BODIES.size() - 1)));
         check(received != null, "the gzipped body the collector received is valid JSON");
+
+        errorClassOverflow(t);
+    }
+
+    /**
+     * The {@code errorsByClass} overflow bucket, end to end (BUG #24 / CONTRACTS section 2 v4).
+     *
+     * <p>{@code ErrorIds} hands out ids 1..254 on first sight of a class and then 255 for ever,
+     * so this needs 254 distinct classes to have been seen. Not one of them has to be a
+     * Throwable: {@code idFor()} keys on the {@code Class} object, and array classes are an
+     * unlimited supply of distinct ones at the price of a zero-length allocation each. A fixture
+     * of 254 hand-written exception types would have put 254 entries in the build manifest and in
+     * {@code classesLoaded} for every assertion in this file to step around.
+     *
+     * <p><b>Runs last, and must.</b> Exhausting the id table is irreversible for the life of the
+     * JVM: every exception class first seen afterwards is id 255, so any earlier assertion about
+     * a named class would start failing. That is also the honest shape of the production
+     * behaviour — the 255th distinct exception type in a JVM is unnameable, which is exactly why
+     * the contract says {@code sum(errorsByClass) <= errors} and forbids a reader from
+     * reconciling the difference.
+     */
+    private static void errorClassOverflow(SmokeTarget t) throws Exception {
+        section("errorsByClass: the id-255 overflow bucket (CONTRACTS section 2 v4)");
+        final Class<?>[] components = {int.class, long.class, double.class, float.class,
+                short.class, byte.class, char.class, boolean.class, Object.class, String.class};
+        int fed = 0;
+        for (int dims = 1; dims <= 40 && fed < 300; dims++) {
+            for (int i = 0; i < components.length && fed < 300; i++) {
+                io.auxin.agent.runtime.ErrorIds.idFor(java.lang.reflect.Array
+                        .newInstance(components[i], new int[dims]).getClass());
+                fed++;
+            }
+        }
+        check(io.auxin.agent.runtime.ErrorIds.idFor(SmokeApp.class)
+                        == io.auxin.agent.runtime.ErrorIds.OVERFLOW,
+                "ErrorIds' 254 name slots are spent after " + fed + " distinct classes, so a "
+                        + "newly seen class now gets the overflow id 255");
+
+        // THREE errors of TWO distinct fresh types, out of one boundary method. Both types land
+        // in the overflow bucket, and the counts there must be SUMMED: a put instead of an add
+        // would report one of them and silently lose the other.
+        for (int i = 0; i < 2; i++) {
+            try {
+                t.boundary(Integer.MIN_VALUE);
+                check(false, "boundary(MIN_VALUE) should throw ArithmeticException");
+            } catch (ArithmeticException expected) {
+                check(true, "boundary(MIN_VALUE) threw ArithmeticException through the probe");
+            }
+        }
+        try {
+            t.boundary(Integer.MIN_VALUE + 1);
+            check(false, "boundary(MIN_VALUE+1) should throw NoSuchElementException");
+        } catch (java.util.NoSuchElementException expected) {
+            check(true, "boundary(MIN_VALUE+1) threw NoSuchElementException through the probe");
+        }
+
+        // 6 calls from the tier-2 section + these 3.
+        final int idx = AuxinAgent.probeIndex("smoke.SmokeTarget", "boundary", "(I)I");
+        long[] o = awaitTier2("smoke.SmokeTarget", idx, 9, 8000);
+        check(o[T2_CALLS] == 9, "tier-2 recorded 9 calls (got " + o[T2_CALLS] + ")");
+        check(o[T2_ERRORS] == 4,
+                "tier-2 recorded 4 errors: 1 IllegalStateException + 3 unnameable (got "
+                        + o[T2_ERRORS] + ")");
+        check(o[T2_OVERFLOW_COUNT] == 3,
+                "all 3 errors of the 2 exhausted-table types are counted against id 255 (got "
+                        + o[T2_OVERFLOW_COUNT] + ")");
+        check(o[T2_OVERFLOW_NAMED] == 1,
+                "and id 255 resolves through errorClasses to the pinned name <overflow>");
+        // >= 2 rather than == 3 only because a background flush may split the three throws
+        // across two windows; two in one bucket already proves the add.
+        check(o[T2_OVERFLOW_IN_ONE_RECORD] >= 2,
+                "at least two distinct classes folded into ONE record's 255 bucket and their "
+                        + "counts were added, not overwritten (largest single bucket: "
+                        + o[T2_OVERFLOW_IN_ONE_RECORD] + ")");
+        check(o[T2_UNRESOLVED_IDS] == 0,
+                "every id in every window still resolves in that window's own table");
+        check(o[T2_SUM_OVER_ERRORS] == 0,
+                "sum(errorsByClass) never EXCEEDS errors, overflow included (excess: "
+                        + o[T2_SUM_OVER_ERRORS] + ")");
+        check(o[T2_ISE_BY_CLASS] == 1,
+                "the one nameable error is still named: the overflow bucket did not swallow the "
+                        + "IllegalStateException recorded before the table filled up");
+        // The global name table now holds 254 names. No window ever shipped them, because a
+        // window emits only the ids its own records referenced.
+        check(o[T2_MAX_TABLE_SIZE] >= 1 && o[T2_MAX_TABLE_SIZE] <= 4,
+                "no window's errorClasses table grew past the ids its records referenced: the "
+                        + "largest table shipped in this run holds " + o[T2_MAX_TABLE_SIZE]
+                        + " entr(ies), against 254 names in the JVM-wide table");
     }
 
     /**
@@ -696,41 +828,108 @@ public class SmokeApp {
         return probes[idx];
     }
 
-    /** @return {calls, errors, nonZeroBuckets, illegalStateErrors} summed over every window. */
+    // Indices of awaitTier2's accumulator, named because it has outgrown four slots.
+    private static final int T2_CALLS = 0;
+    private static final int T2_ERRORS = 1;
+    private static final int T2_NONZERO_BUCKETS = 2;
+    private static final int T2_ISE_BY_TYPE = 3;
+    /** IllegalStateException counted through errorsByClass + errorClasses (CONTRACTS v4). */
+    private static final int T2_ISE_BY_CLASS = 4;
+    /** errorsByClass keys that were non-numeric, or absent from their OWN window's table. */
+    private static final int T2_UNRESOLVED_IDS = 5;
+    /** How far sum(errorsByClass) exceeded `errors`. Must be 0: the slack is one-directional. */
+    private static final int T2_SUM_OVER_ERRORS = 6;
+    /** Errors counted against id 255, summed over every window. */
+    private static final int T2_OVERFLOW_COUNT = 7;
+    /** 1 once some window resolved id 255 to the pinned name {@code <overflow>}. */
+    private static final int T2_OVERFLOW_NAMED = 8;
+    /** The largest count any single record put in its 255 bucket: proves the counts are SUMMED. */
+    private static final int T2_OVERFLOW_IN_ONE_RECORD = 9;
+    /** The largest errorClasses table any window shipped: proves only referenced ids are sent. */
+    private static final int T2_MAX_TABLE_SIZE = 10;
+    private static final int T2_SLOTS = 11;
+
+    /**
+     * @return one accumulator, summed over every window the collector has received, indexed by
+     *         the {@code T2_*} constants above.
+     */
     private static long[] awaitTier2(String cls, int idx, long expectedCalls, long timeoutMs)
             throws Exception {
         long deadline = System.currentTimeMillis() + timeoutMs;
-        long[] acc = new long[4];
+        long[] acc = new long[T2_SLOTS];
         while (System.currentTimeMillis() < deadline) {
             Thread.sleep(200);
             AuxinAgent.flushNow();
-            acc = new long[4];
+            acc = new long[T2_SLOTS];
             synchronized (BODIES) {
                 for (int i = 0; i < BODIES.size(); i++) {
                     Map<String, Object> w = Json.asObject(Json.parse(BODIES.get(i)));
                     List<Object> t2 = Json.asArray(w.get("tier2"));
                     if (t2 == null) continue;
+                    // THE window-local rule, enforced here rather than assumed: the table is
+                    // read out of the same window object as the records that reference it, so an
+                    // id that only resolves against some other window's table shows up as
+                    // unresolvable instead of quietly resolving to the wrong class name.
+                    Map<String, Object> errorClasses = Json.asObject(w.get("errorClasses"));
+                    if (errorClasses != null && errorClasses.size() > acc[T2_MAX_TABLE_SIZE]) {
+                        acc[T2_MAX_TABLE_SIZE] = errorClasses.size();
+                    }
                     for (int j = 0; j < t2.size(); j++) {
                         Map<String, Object> e = Json.asObject(t2.get(j));
                         if (!cls.equals(Json.str(e, "class", "")) || Json.num(e, "idx", -1) != idx) continue;
-                        acc[0] += Json.num(e, "calls", 0);
-                        acc[1] += Json.num(e, "errors", 0);
+                        acc[T2_CALLS] += Json.num(e, "calls", 0);
+                        acc[T2_ERRORS] += Json.num(e, "errors", 0);
                         List<Object> buckets = Json.asArray(e.get("buckets"));
                         if (buckets != null) {
                             for (int b = 0; b < buckets.size(); b++) {
-                                if (((Number) buckets.get(b)).longValue() > 0) acc[2]++;
+                                if (((Number) buckets.get(b)).longValue() > 0) acc[T2_NONZERO_BUCKETS]++;
                             }
                         }
                         Map<String, Object> types = Json.asObject(e.get("errorTypes"));
                         if (types != null) {
-                            acc[3] += Json.num(types, "java.lang.IllegalStateException", 0);
+                            acc[T2_ISE_BY_TYPE] += Json.num(types, "java.lang.IllegalStateException", 0);
                         }
+                        foldErrorsByClass(e, errorClasses, acc);
                     }
                 }
             }
-            if (acc[0] >= expectedCalls) return acc;
+            if (acc[T2_CALLS] >= expectedCalls) return acc;
         }
         return acc;
+    }
+
+    /**
+     * Reads one record's {@code errorsByClass} exactly the way CONTRACTS section 2 v4 says a
+     * reader must: parse the key to an int, resolve it in the table that came with THIS window,
+     * store the name, and never reconcile {@code sum != errors}.
+     */
+    private static void foldErrorsByClass(Map<String, Object> record,
+                                          Map<String, Object> errorClasses, long[] acc) {
+        Map<String, Object> byClass = Json.asObject(record.get("errorsByClass"));
+        if (byClass == null) return;          // absent is legal: "types unavailable", not zero
+        long sum = 0;
+        for (Map.Entry<String, Object> en : byClass.entrySet()) {
+            long n = en.getValue() instanceof Number ? ((Number) en.getValue()).longValue() : -1;
+            if (n < 0) { acc[T2_UNRESOLVED_IDS]++; continue; }
+            sum += n;
+            int id;
+            try {
+                id = Integer.parseInt(en.getKey());
+            } catch (NumberFormatException bad) {
+                acc[T2_UNRESOLVED_IDS]++;     // "keys are JSON strings. Parse to int; reject non-numeric"
+                continue;
+            }
+            String name = Json.str(errorClasses, String.valueOf(id), null);
+            if (name == null) acc[T2_UNRESOLVED_IDS]++;
+            else if ("java.lang.IllegalStateException".equals(name)) acc[T2_ISE_BY_CLASS] += n;
+            if (id == 255) {
+                acc[T2_OVERFLOW_COUNT] += n;
+                if ("<overflow>".equals(name)) acc[T2_OVERFLOW_NAMED] = 1;
+                if (n > acc[T2_OVERFLOW_IN_ONE_RECORD]) acc[T2_OVERFLOW_IN_ONE_RECORD] = n;
+            }
+        }
+        long errors = Json.num(record, "errors", 0);
+        if (sum > errors) acc[T2_SUM_OVER_ERRORS] += sum - errors;
     }
 
     private static boolean hasTier2For(String body, String cls) {

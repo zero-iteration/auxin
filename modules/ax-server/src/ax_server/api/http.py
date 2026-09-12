@@ -117,6 +117,22 @@ def make_api_router(api: QueryService) -> Router:
             r"/v1/effective-false-positives",
             lambda **_: (200, api.effective_false_positives()),
         )
+        # BUG #28: the default suppression list has to be LISTABLE, or it is an
+        # invisible filter.
+        .add("GET", r"/v1/suppressions", lambda **_: (200, api.suppressions()))
+        # BUG #24: "top exception classes for this build".
+        .add(
+            "GET",
+            r"/v1/builds/(?P<build>[^/]+)/exception-classes",
+            lambda *, params, query, **_: (
+                200,
+                api.exception_classes(
+                    params["build"],
+                    since_days=_int(query, "sinceDays", 7),
+                    limit=_int(query, "limit", 20),
+                ),
+            ),
+        )
         # -- SCOPE-v3 runtime call graph ---------------------------------
         .add("GET", r"/v1/builds/(?P<build>[^/]+)/callers", callers)
         .add("GET", r"/v1/builds/(?P<build>[^/]+)/callees", callees)

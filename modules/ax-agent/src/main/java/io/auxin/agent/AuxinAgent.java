@@ -111,8 +111,27 @@ public final class AuxinAgent {
 
         EnvironmentClassification env = EnvironmentClassification.detect(o);
 
-        Clock clock = Clock.calibrate();
-        if (clock.degraded()) Health.degrade("clockDegraded");
+        Clock clock = Clock.calibrate(o.clockSampledThresholdNs, o.clockDisabledThresholdNs);
+        // BUG #30 (owner's call, escalated by the #25 fix): a slow clock must NOT degrade the
+        // window. `degraded: true` means "this window's coverage is untrustworthy" and CONTRACTS
+        // discards such a window as death evidence -- but a slow clock affects ONLY the latency
+        // buckets. Coverage bits and call counts are computed without the clock at all.
+        //
+        // Worse than over-broad: the field trial showed the clock decision is jittery near its
+        // threshold ("same machine, two boots: one disabled, the next sampled"), so coupling them
+        // made a boot-to-boot coin flip silently discard a whole window's COVERAGE -- and coverage
+        // is the substrate the entire dead-code verdict rests on. Non-deterministic evidence loss
+        // for an unrelated reason.
+        //
+        // Nothing is hidden by decoupling: `clockNs`, `clockDegraded` and (since #25)
+        // `tier2TimingMode` all still ship, so a reader can see exactly what was lost -- the
+        // percentiles, and only the percentiles. Same argument that keeps `edgeTierFailures` out
+        // of `degraded`.
+        if (clock.degraded()) {
+            Log.warn("clock too slow for tier-2 timing (clockNs=" + clock.nanosPerCall()
+                    + "): percentiles are unavailable. Coverage, calls and errors are UNAFFECTED "
+                    + "and this window is NOT degraded.");
+        }
 
         Ring ring = null;
         Tier2Aggregator aggregator = new Tier2Aggregator();
@@ -173,6 +192,12 @@ public final class AuxinAgent {
                 // G5-BUG-1: the prefixes that can veto the operator's own scope, printed so
                 // "the agent instrumented nothing" is diagnosable from the startup line alone.
                 + " agentRuntime=" + IgnoreRules.agentRuntime()
+                // BUG #25: the timing mode and its consequence belong on the line an operator
+                // actually reads. "tier2TimingMode=disabled" alone reads as "tier-2 is dead on
+                // this host"; it means "no percentiles, counts unaffected", and that is the
+                // difference between ignoring the agent and ripping it out.
+                + " tier2TimingMode=" + clock.wireMode()
+                + " (" + clock.consequence() + ")"
                 + " livenessEvidence=" + env.livenessEvidence());
     }
 

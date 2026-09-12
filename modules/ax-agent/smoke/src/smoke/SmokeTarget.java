@@ -64,6 +64,14 @@ public class SmokeTarget {
     /** tier-2 boundary method: timed, counted, and its errors classified. */
     public int boundary(int n) {
         counter += n;
+        // Two DISTINCT exception types nothing else in this fixture throws, for the
+        // errorsByClass overflow bucket (CONTRACTS section 2 v4). SmokeApp exhausts ErrorIds'
+        // 254 name slots and then calls these, so both are unnameable and both must fold into
+        // id 255 with their counts SUMMED. They are JDK types on purpose: a fixture exception
+        // class would add a class to the manifest, to classesLoaded and to the coverage array
+        // that a dozen exact assertions in this suite would then have to make room for.
+        if (n == Integer.MIN_VALUE) throw new ArithmeticException("overflow-a");
+        if (n == Integer.MIN_VALUE + 1) throw new java.util.NoSuchElementException("overflow-b");
         if (n < 0) throw new IllegalStateException("negative");
         long t = 0;
         for (int i = 0; i < n * 10; i++) t += i;

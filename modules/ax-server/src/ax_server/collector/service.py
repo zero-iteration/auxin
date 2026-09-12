@@ -10,10 +10,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ax_server.collector.buckets import BUCKET_SCHEME, percentiles
-from ax_server.collector.classification import EnvironmentPolicy
-from ax_server.collector.decode import decode_window
+from ax_server.collector.classification import NON_PRODUCTION_MEANING, EnvironmentPolicy
+from ax_server.collector.decode import decode_error_classes, decode_window
 from ax_server.collector.errors import IngestRejected, RejectReason
-from ax_server.collector.health import IngestHealth
+from ax_server.collector.health import ERROR_ATTRIBUTION_NOTE, IngestHealth
 from ax_server.collector.known_methods import UNCHECKED, KnownMethods
 from ax_server.collector.testrunner import TestRunnerDetector
 from ax_server.store.bitset import and_not, newly_set, popcount
@@ -69,6 +69,28 @@ class IngestResult:
     #: for those classes, which is a different fact from "no mask was sent".
     install_masks_dropped: int = 0
     strip_mask_missing: int = 0
+    # -- BUG #22b: the C50 evidence gate, as a result and not a 403 ------
+    #: The label this JVM reported, and whether it cleared the allowlist. A
+    #: non-production window is ACCEPTED (`accepted=True`) and STORED -- it is
+    #: simply evidence for nothing, and these fields are how the user finds
+    #: that out from the ingest response itself.
+    environment: str = "production"
+    production: bool = True
+    liveness_evidence: bool = True
+    #: What was withheld because the window is not evidence. Every one of
+    #: these would have been a merge into something the analysis reads.
+    coverage_records_withheld: int = 0
+    probe_bits_withheld: int = 0
+    classes_loaded_withheld: int = 0
+    edges_withheld: int = 0
+    # -- BUG #24: exception classes, per window --------------------------
+    #: Size of the window-local `errorClasses` table, and the attribution
+    #: split. `errors_unattributed` is legal and is never reconciled.
+    error_classes_named: int = 0
+    errors_attributed: int = 0
+    errors_unattributed: int = 0
+    error_class_ids_unresolved: int = 0
+    tier2_records_without_error_types: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -76,6 +98,26 @@ class IngestResult:
             "buildSha": self.build_sha,
             "artifact": self.artifact,
             "instanceId": self.instance_id,
+            "environment": self.environment,
+            "production": self.production,
+            "livenessEvidence": self.liveness_evidence,
+            "nonProductionWithheld": {
+                "coverageRecords": self.coverage_records_withheld,
+                "probeBits": self.probe_bits_withheld,
+                "classesLoaded": self.classes_loaded_withheld,
+                "edges": self.edges_withheld,
+            },
+            "livenessEvidenceNote": (
+                NON_PRODUCTION_MEANING
+                if not self.liveness_evidence
+                else "this window is production-classified and is usable as evidence"
+            ),
+            "errorClassesNamed": self.error_classes_named,
+            "errorsAttributed": self.errors_attributed,
+            "errorsUnattributed": self.errors_unattributed,
+            "errorClassIdsUnresolved": self.error_class_ids_unresolved,
+            "tier2RecordsWithoutErrorTypes": self.tier2_records_without_error_types,
+            "errorAttributionNote": ERROR_ATTRIBUTION_NOTE,
             "classesMerged": self.classes_merged,
             "probesNewlySet": self.probes_newly_set,
             "schemaMismatches": list(self.schema_mismatches),
@@ -172,7 +214,11 @@ class CollectorService:
         except IngestRejected as exc:
             self._log_and_count(exc, payload)
             raise
-        return self._apply(window, discarded)
+        # Re-read purely for the counter; `decode_window` already validated it,
+        # so this cannot raise, and it keeps the table out of `IngestWindow`
+        # where a window-local id has no business being persisted.
+        named = len(decode_error_classes(payload))
+        return self._apply(window, discarded, error_classes_named=named)
 
     # -- internals -------------------------------------------------------
 
@@ -187,9 +233,41 @@ class CollectorService:
             self._reject(RejectReason.BAD_GZIP, f"could not gunzip body: {exc}", None)
         raise AssertionError("unreachable")
 
-    def _apply(self, window: IngestWindow, discarded: int) -> IngestResult:
+    def _apply(
+        self, window: IngestWindow, discarded: int, *, error_classes_named: int = 0
+    ) -> IngestResult:
         when = window.end
         self.store.record_window(window)
+
+        # -- BUG #22b: the evidence gate, in ONE place --------------------
+        #
+        # A non-production window is PERSISTED above -- the user sees the row,
+        # the counters and its tier-2 timings -- and then contributes to
+        # nothing below. Every merge skipped here is a merge into something
+        # the analysis reads as evidence:
+        #
+        #   merge_coverage          -> `observed` -> LIVE
+        #   merge_probes_installed  -> whether an unset bit is death evidence
+        #   class_loaded            -> removes the C10 `class-never-loaded` blocker
+        #   record_edges            -> an observed inbound edge -> LIVE
+        #
+        # That last pair is why "just don't count it as liveness" is not
+        # enough: `class_loaded` and the install mask make a DEAD_CANDIDATE
+        # MORE likely, so a laptop could manufacture one. Withholding all four
+        # is what makes storing the window safe in both directions.
+        #
+        # `classes_loaded` is withheld inside `SqliteStore.record_window`,
+        # which is the only writer of that table; it is counted here.
+        evidence = window.usable_as_life_evidence
+        if not evidence:
+            log.info(
+                "NON-PRODUCTION window STORED build=%s instance=%s environment=%r "
+                "livenessEvidence=false -- %d coverage record(s), %d probe bit(s), "
+                "%d loaded class(es) and %d edge(s) withheld from evidence. %s",
+                window.build_sha, window.instance_id, window.environment,
+                len(window.coverage), sum(popcount(r.probes) for r in window.coverage),
+                len(window.classes_loaded), len(window.edges), NON_PRODUCTION_MEANING,
+            )
 
         mismatches: list[str] = []
         merged = 0
@@ -211,7 +289,7 @@ class CollectorService:
             else _null_context()
         )
         with attribution:
-            for record in window.coverage:
+            for record in window.coverage if evidence else ():
                 existing = self.store.coverage(window.build_sha, record.cls) or b""
                 try:
                     self.store.merge_coverage(
@@ -331,7 +409,13 @@ class CollectorService:
         # per-window delta. Two operations, two semantics, two code paths.
         edges_merged = 0
         edge_health = window.agent_health.edges
-        if isinstance(self.store, EdgeStore):
+        if not evidence:
+            # CONTRACTS 2 v3: an edge "is evidence of liveness only, and only
+            # under the same C50 gate as everything else in the window". An
+            # observed inbound edge short-circuits straight to LIVE, so a
+            # laptop's edges must never reach the aggregate.
+            pass
+        elif isinstance(self.store, EdgeStore):
             edges_merged = self.store.record_edges(window)
         elif window.edges:
             log.warning(
@@ -340,9 +424,9 @@ class CollectorService:
                 type(self.store).__name__, len(window.edges),
                 window.build_sha, window.instance_id,
             )
-        edge_observations = sum(e.count for e in window.edges)
+        edge_observations = sum(e.count for e in window.edges) if evidence else 0
         verified = self.known_methods.knows_build(window.build_sha)
-        if window.edges and not verified:
+        if evidence and window.edges and not verified:
             log.warning(
                 "edge endpoints NOT verified for build=%s (%s); a dangling (class, idx) "
                 "would not have been caught",
@@ -367,10 +451,38 @@ class CollectorService:
                 window.agent_health.ring_dropped, window.agent_health.transform_failures,
             )
 
+        # Bug #22b bookkeeping: what a non-production window did NOT contribute.
+        # Zero on a production window by construction -- `evidence` is the same
+        # flag that gated every merge above, so these can never disagree with
+        # what actually happened.
+        withheld_coverage = 0 if evidence else len(window.coverage)
+        withheld_bits = 0 if evidence else sum(popcount(r.probes) for r in window.coverage)
+        withheld_loaded = 0 if evidence else len(window.classes_loaded)
+        withheld_edges = 0 if evidence else len(window.edges)
+
+        # Bug #24 per-window attribution, summed from the records the decoder
+        # already resolved. `unattributed` is NOT an error here: it is the
+        # legal remainder of a 254-entry table plus an overflow bucket.
+        errors_attributed = sum(r.attributed_errors for r in window.tier2)
+        errors_unattributed = sum(r.unattributed_errors for r in window.tier2)
+        ids_unresolved = sum(r.unresolved_id_errors for r in window.tier2)
+        no_types = sum(
+            1 for r in window.tier2 if r.errors and not r.error_types_available
+        )
+        if errors_unattributed or ids_unresolved:
+            log.info(
+                "tier-2 errors partially unattributed build=%s instance=%s: %d named, "
+                "%d unattributed (%d under an id this window's errorClasses table did "
+                "not name). This is legal -- 254-class table, id 255 = overflow, errors "
+                "counted unconditionally -- and is NEVER reconciled by inventing a class",
+                window.build_sha, window.instance_id, errors_attributed,
+                errors_unattributed, ids_unresolved,
+            )
+
         self.health.accept(
             degraded=window.agent_health.degraded,
             classes_merged=merged,
-            classes_loaded=len(window.classes_loaded),
+            classes_loaded=len(window.classes_loaded) if evidence else 0,
             probes_newly_set=fresh_bits,
             tier2_records=len(window.tier2),
             discarded_test_records=discarded,
@@ -379,10 +491,16 @@ class CollectorService:
             edges_reported=window.edges_present,
             edges_enabled=edge_health.enabled,
             edges_sample_rate=edge_health.sample_rate,
-            edges_verified=verified or not window.edges,
+            edges_verified=verified or not window.edges or not evidence,
             install_mask_records=install_merged,
             records_without_install_mask=install_absent,
             strip_mask_missing=window.agent_health.strip_mask_missing,
+            production=window.production,
+            environment=window.environment,
+            coverage_records_withheld=withheld_coverage,
+            probe_bits_withheld=withheld_bits,
+            classes_loaded_withheld=withheld_loaded,
+            edges_withheld=withheld_edges,
         )
 
         pcts = {
@@ -411,6 +529,18 @@ class CollectorService:
             install_mask_inconsistencies=install_inconsistent,
             install_masks_dropped=install_unsupported + install_dropped,
             strip_mask_missing=window.agent_health.strip_mask_missing,
+            environment=window.environment,
+            production=window.production,
+            liveness_evidence=window.liveness_evidence and window.production,
+            coverage_records_withheld=withheld_coverage,
+            probe_bits_withheld=withheld_bits,
+            classes_loaded_withheld=withheld_loaded,
+            edges_withheld=withheld_edges,
+            error_classes_named=error_classes_named,
+            errors_attributed=errors_attributed,
+            errors_unattributed=errors_unattributed,
+            error_class_ids_unresolved=ids_unresolved,
+            tier2_records_without_error_types=no_types,
         )
 
     def _reject(

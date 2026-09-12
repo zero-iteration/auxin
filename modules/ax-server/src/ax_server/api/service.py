@@ -22,7 +22,10 @@ from ax_server.analysis.models import (
     Verdict,
 )
 from ax_server.analysis.runtime_edges import RuntimeCallGraph
+from ax_server.analysis.suppression import Suppressions
 from ax_server.collector.buckets import percentiles
+from ax_server.collector.classification import NON_PRODUCTION_MEANING, UNCLASSIFIED
+from ax_server.collector.health import ERROR_ATTRIBUTION_NOTE
 from ax_server.collector.service import CollectorService
 from ax_server.store.models import EdgeAggregate
 
@@ -319,18 +322,33 @@ class QueryService:
             idx = int(row["idx"])
             buckets = self.engine.store.tier2_buckets(build_sha, cls, idx, since)
             method = self._method_name(cls, idx)
-            out.append(
-                {
-                    "class": cls,
-                    "idx": idx,
-                    "method": method,
-                    "calls": row["calls"],
-                    "errors": row["errors"],
-                    # Computed here, never sent by the agent (CONTRACTS 2 / C31).
-                    "percentiles": percentiles(buckets),
-                    "bucketScheme": "loglinear-16-v1",
-                }
-            )
+            # BUG #24: the exception-class breakdown rides WITH the error count
+            # instead of being a separate query nobody makes. "1201 calls, 3
+            # errors" was the whole answer before; "3 errors, all
+            # java.net.SocketTimeoutException" is the answer the README
+            # promised.
+            # `.get` rather than `[...]`: `tier2_rows` is an ADAPTER EXTRA, not
+            # part of the frozen port, so a store that has not grown the key
+            # must keep working -- it simply reports the count with no names.
+            classes = dict(row.get("errorClasses") or {})
+            entry: dict[str, Any] = {
+                "class": cls,
+                "idx": idx,
+                "method": method,
+                "calls": row["calls"],
+                "errors": row["errors"],
+                # Computed here, never sent by the agent (CONTRACTS 2 / C31).
+                "percentiles": percentiles(buckets),
+                "bucketScheme": "loglinear-16-v1",
+            }
+            if classes:
+                entry["errorClasses"] = classes.get("byClass", {})
+                entry["errorsAttributed"] = classes.get("attributed", 0)
+                entry["errorsUnattributed"] = classes.get("unattributed", 0)
+                entry["errorTypesAvailable"] = classes.get("typesAvailable", False)
+                entry["errorTypesSource"] = classes.get("source")
+                entry["errorReading"] = self._error_reading(dict(classes))
+            out.append(entry)
         return out
 
     # -- runtime call graph (SCOPE-v3) -----------------------------------
@@ -660,11 +678,38 @@ class QueryService:
             if eh.enabled or eh.sample_rate:
                 sample_rates[eh.sample_rate] = sample_rates.get(eh.sample_rate, 0) + 1
 
+        # BUG #22b. The trial's complaint was that an unclassified JVM produced
+        # "0 windows stored" with a 403 and no explanation. Now the windows are
+        # stored, so this is the place the user finds out what they are worth --
+        # a count, the labels involved (so the `--allow-environments` fix is
+        # obvious), and one sentence saying what it means for verdicts.
+        non_production = [w for w in windows if not w.production]
+        environments: dict[str, int] = {}
+        for w in windows:
+            environments[w.environment] = environments.get(w.environment, 0) + 1
+        usable = sum(1 for w in windows if w.usable_as_death_evidence)
+
         result: dict[str, Any] = {
             "buildSha": build_sha,
             "windows": len(windows),
             "degradedWindows": degraded,
             "clockDegradedWindows": clock_degraded,
+            "environments": dict(sorted(environments.items())),
+            "nonProductionWindows": len(non_production),
+            "nonProductionEnvironments": dict(
+                sorted(
+                    (
+                        (label, sum(1 for w in non_production if w.environment == label))
+                        for label in {w.environment for w in non_production}
+                    )
+                )
+            ),
+            "windowsUsableAsDeathEvidence": usable,
+            "livenessEvidenceWindows": sum(
+                1 for w in windows if w.usable_as_life_evidence
+            ),
+            "evidenceGate": self._environment_diagnosis(windows),
+            "nonProductionNote": NON_PRODUCTION_MEANING,
             "transformFailuresTotal": transform_failures,
             "ringDroppedTotal": ring_dropped,
             "classesSkippedTotal": skipped,
@@ -704,6 +749,126 @@ class QueryService:
             result["recentRejects"] = rejects(build_sha, 20)
         return result
 
+    @staticmethod
+    def _environment_diagnosis(windows: Sequence[Any]) -> str:
+        """BUG #22b: the one line that tells a first-time user what to do next.
+
+        Deliberately an explanation and not a status code. The trial user had
+        to read the collector source to discover that `production`/`prod` were
+        the only accepted labels; nobody should have to do that twice.
+        """
+        if not windows:
+            return (
+                "No window has been stored for this build. Nothing has reported yet, or "
+                "every ingest was refused -- see rejectsByReason in the ingest counters."
+            )
+        non_production = [w for w in windows if not w.production]
+        if not non_production:
+            return (
+                f"All {len(windows)} window(s) are production-classified and are usable as "
+                "evidence (subject to the degraded and test-taint gates)."
+            )
+        labels = sorted({w.environment for w in non_production})
+        # `unclassified` is OUR placeholder for "the window carried no label at
+        # all", not something a JVM reported -- so it must never be offered as
+        # a `--allow-environments` value. Allowlisting it would re-create C50:
+        # every unlabelled JVM, CI included, would count as production.
+        reported = [label for label in labels if label and label != UNCLASSIFIED]
+        fix = (
+            f"pass `--allow-environments {','.join(reported)}` if those labels really are "
+            "production environments"
+            if reported
+            else (
+                "these windows carry NO environment label at all, so there is nothing to "
+                "allowlist -- set ax.environment=production on the JVMs you want "
+                "conclusions from"
+            )
+        )
+        if len(non_production) == len(windows):
+            return (
+                f"EVERY one of the {len(windows)} stored window(s) is NON-PRODUCTION "
+                f"(labels: {labels}). Data IS arriving and being stored -- it is counted "
+                "and its tier-2 timings and exception classes are queryable -- but none of "
+                "it is evidence, so every verdict is UNKNOWN and no DEAD_CANDIDATE can "
+                f"exist. Set ax.environment=production, or {fix}."
+            )
+        return (
+            f"{len(non_production)} of {len(windows)} stored window(s) are non-production "
+            f"(labels: {labels}) and contributed nothing to any verdict. To use them, "
+            f"{fix}."
+        )
+
+    # -- exception classes (bug #24) -------------------------------------
+
+    def exception_classes(
+        self, build_sha: str, *, since_days: int = 7, limit: int = 20
+    ) -> dict[str, Any]:
+        """"Top exception classes for this build" -- BUG #24.
+
+        The README promised *"what does it throw -- exception class names"* and
+        shipped a scalar count: `Tier2Aggregator` kept `errorCounts[]` by class
+        id, `ErrorIds` kept the name table, and both were dropped at the wire.
+        This is the aggregate half of the answer; `hot_methods` carries the
+        per-method half.
+
+        Three numbers that are never collapsed into one, because the contract
+        says a reader must not reconcile them:
+
+            attributed    errors we can name a class for
+            unattributed  `errors - attributed`; legal, and NOT an error
+            errors        the unconditional total
+        """
+        since = datetime.now(tz=UTC) - timedelta(days=since_days)
+        totals_fn = getattr(self.engine.store, "error_class_totals", None)
+        if totals_fn is None:
+            return {
+                "buildSha": build_sha,
+                "supported": False,
+                "topClasses": [],
+                "note": (
+                    "This store does not implement Tier2ErrorStore, so no exception-class "
+                    "breakdown is available. `errors` counts are unaffected."
+                ),
+            }
+        payload = dict(totals_fn(build_sha, since, limit))
+        payload["buildSha"] = build_sha
+        payload["supported"] = True
+        payload["sinceDays"] = since_days
+        payload["note"] = ERROR_ATTRIBUTION_NOTE
+        payload["reading"] = self._error_reading(payload)
+        return payload
+
+    @staticmethod
+    def _error_reading(payload: dict[str, Any]) -> str:
+        """Say out loud which of the three legal shapes this answer is in."""
+        errors = int(payload.get("errors", 0) or 0)
+        attributed = int(payload.get("attributed", 0) or 0)
+        unattributed = int(payload.get("unattributed", 0) or 0)
+        unresolved = int(payload.get("unresolvedIds", 0) or 0)
+        if not errors:
+            return "No errors were recorded in this window range."
+        if not payload.get("typesAvailable"):
+            return (
+                f"{errors} error(s) recorded and exception TYPES ARE UNAVAILABLE for all "
+                "of them -- the agent sent no errorsByClass breakdown (an older agent, or "
+                "its id table was unavailable). This is not 'zero exception types'; it is "
+                "'we have the count and not the names'."
+            )
+        parts = [f"{attributed} of {errors} error(s) are attributed to a named class"]
+        if unattributed:
+            parts.append(
+                f"{unattributed} are UNATTRIBUTED and stay that way: the agent's table "
+                "holds 254 classes with id 255 as an overflow bucket while `errors` is "
+                "counted unconditionally, so the shortfall is expected and is never "
+                "closed by inventing a class"
+            )
+        if unresolved:
+            parts.append(
+                f"{unresolved} of those arrived under an id that the window's own "
+                "errorClasses table did not name, so they have no name to give"
+            )
+        return "; ".join(parts) + "."
+
     def coverage_windows(self, build_sha: str) -> dict[str, Any]:
         ev = self.engine.evidence(build_sha)
         def row(w: Any, usable: bool) -> dict[str, Any]:
@@ -732,6 +897,34 @@ class QueryService:
             ),
             "usable": [row(w, True) for w in ev.usable_windows],
             "excluded": [row(w, False) for w in ev.excluded_windows],
+        }
+
+    # -- suppressions (bug #28) ------------------------------------------
+
+    def suppressions(self) -> dict[str, Any]:
+        """Every active suppression rule and WHICH LIST it came from.
+
+        BUG #28 ships a default list, and a default filter nobody can see is
+        worse than the false positives it removes. So the whole set is
+        enumerable -- in match order, with the origin, source file and line of
+        every rule -- and `defaultsEnabled` says whether the defaults are on.
+        """
+        active: Suppressions = self.engine.suppressions
+        user: Suppressions = getattr(self.engine, "user_suppressions", Suppressions(()))
+        return {
+            "rules": active.listing(),
+            "count": len(active),
+            "countsByOrigin": active.counts_by_origin(),
+            "userRules": len(user),
+            "defaultsEnabled": bool(self.engine.config.default_suppressions),
+            "note": (
+                "Matched in the order listed, first match wins, BEFORE any verdict is "
+                "computed (CONTRACTS 5). User rules come first, so a user pattern always "
+                "wins the attribution. A suppressed method is UNKNOWN and still appears in "
+                "the output with a `suppressed:` reason naming the list it came from -- it "
+                "is never silently omitted. Run with --no-default-suppressions to use the "
+                "user's file alone."
+            ),
         }
 
     def proposals(self, build_sha: str) -> list[dict[str, Any]]:

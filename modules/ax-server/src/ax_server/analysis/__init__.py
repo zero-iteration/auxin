@@ -24,7 +24,14 @@ from ax_server.analysis.runtime_edges import (
     load_runtime_call_graph,
     manifest_method_index,
 )
-from ax_server.analysis.suppression import Suppressions
+from ax_server.analysis.suppression import (
+    DEFAULT_SUPPRESSIONS,
+    SuppressionRule,
+    Suppressions,
+    compose_suppressions,
+    default_suppressions,
+    manifest_suppressions,
+)
 
 __all__ = [
     "AnalysisConfig",
@@ -50,15 +57,20 @@ __all__ = [
     "ProposalRateLimiter",
     "RuleClassStats",
     "RuntimeCallGraph",
+    "DEFAULT_SUPPRESSIONS",
     "SqliteProposalLedger",
+    "SuppressionRule",
     "Suppressions",
     "UNKNOWN",
     "Verdict",
+    "compose_suppressions",
     "compute_reachability",
+    "default_suppressions",
     "efp_keys",
     "effective_eligibility",
     "load_installed_probes",
     "load_manifest",
     "load_runtime_call_graph",
     "manifest_method_index",
+    "manifest_suppressions",
 ]

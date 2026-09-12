@@ -177,8 +177,13 @@ def evaluate(f: MethodFacts) -> RuleOutcome:
     # 1. SUPPRESSION -- CONTRACTS 5, matched before any verdict is computed.
     if f.suppression is not None:
         rule = f.suppression
+        # BUG #28: `provenance` names WHICH LIST the rule came from -- user or
+        # default -- because a suppression the user did not write and cannot
+        # attribute is indistinguishable from a bug. The head of the reason
+        # stays exactly `suppressed:` so `first_blocking_reason` (which splits
+        # on the first colon) keeps working.
         reasons.append(
-            f"suppressed: matched {rule.pattern!r} at {rule.source}:{rule.line_no}"
+            f"suppressed: matched {rule.pattern!r} {rule.provenance}"
             + (f" ({rule.comment})" if rule.comment else "")
         )
         blockers.append("suppressed")

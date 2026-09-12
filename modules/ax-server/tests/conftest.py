@@ -13,6 +13,7 @@ from ax_server.analysis.phases import PhaseCalendar, PhaseOccurrence
 from ax_server.analysis.proposals import SqliteProposalLedger
 from ax_server.analysis.runtime_edges import manifest_method_index
 from ax_server.analysis.suppression import Suppressions
+from ax_server.collector.classification import EnvironmentPolicy
 from ax_server.collector.service import CollectorService
 from ax_server.store.bitset import from_indices
 from ax_server.store.sqlite_store import SqliteStore
@@ -247,6 +248,20 @@ def collector(store: SqliteStore) -> CollectorService:
 
 
 @pytest.fixture
+def strict_collector(store: SqliteStore) -> CollectorService:
+    """A collector in `--reject-unclassified` mode (bug #22b).
+
+    The pre-#22b DEFAULT, kept as an explicit opt-in. Every test that pins the
+    403 now names this fixture, so "the cliff still works when you ask for it"
+    and "the default no longer has a cliff" are both pinned, by separate tests,
+    with the same assertions as before.
+    """
+    return CollectorService(
+        store, policy=EnvironmentPolicy(reject_non_production=True)
+    )
+
+
+@pytest.fixture
 def manifest():
     return load_manifest(FIXTURES / "manifest.json")
 
@@ -347,3 +362,68 @@ def ingested_tier1_disabled(collector: CollectorService) -> CollectorService:
 
 def verdict_map(run) -> dict[str, Any]:
     return {f"{v.cls}#{v.method}{v.desc}": v for v in run.verdicts}
+
+
+# -- BUG #22b: the unclassified JVM the field trial actually had ---------
+
+
+def unclassified_payload(day: int, *, environment: str | None = None) -> dict[str, Any]:
+    """`realistic_payload` from a JVM with `ax.environment` unset.
+
+    This is the exact shape the trial hit: no classification anywhere, so the
+    agent sets `livenessEvidence=false` and the collector used to answer 403
+    `not_production_classified` for every window.
+    """
+    body = realistic_payload(day)
+    del body["jvmClassification"]
+    body["agentHealth"]["livenessEvidence"] = False
+    if environment is not None:
+        body["agentHealth"]["environment"] = environment
+        body["agentHealth"]["livenessEvidence"] = False
+    return body
+
+
+# -- BUG #24: the contract v4 wire shape --------------------------------
+
+#: The window-local name table from CONTRACTS 2 v4's own example, including the
+#: id-255 overflow entry.
+ERROR_CLASSES: dict[str, str] = {
+    "1": "java.net.SocketTimeoutException",
+    "2": "java.lang.NullPointerException",
+    "255": "<overflow>",
+}
+
+
+#: Sentinel for `payload_v4(error_classes=...)`. `None` there means OMIT the
+#: table -- which is a legal window and a distinct test case -- so "use the
+#: default table" needs its own value.
+UNSET: Any = object()
+
+
+def payload_v4(
+    day: int,
+    *,
+    error_classes: dict[str, str] | None = UNSET,
+    errors_by_class: dict[str, int] | None = None,
+    errors: int = 3,
+    drop_error_types: bool = True,
+    instance_id: str = "pod-7f3a",
+) -> dict[str, Any]:
+    """`realistic_payload` with the v4 `errorClasses` + `errorsByClass` shape.
+
+    `drop_error_types` removes the pre-v4 `errorTypes` key so a test that
+    exercises id resolution cannot accidentally be satisfied by the legacy
+    name map instead.
+    """
+    body = realistic_payload(day)
+    body["instanceId"] = instance_id
+    table = ERROR_CLASSES if error_classes is UNSET else error_classes
+    if table is not None:
+        body["errorClasses"] = dict(table)
+    rec = body["tier2"][0]
+    rec["errors"] = errors
+    if drop_error_types:
+        rec.pop("errorTypes", None)
+    if errors_by_class is not None:
+        rec["errorsByClass"] = dict(errors_by_class)
+    return body

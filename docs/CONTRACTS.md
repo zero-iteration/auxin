@@ -160,9 +160,84 @@ File: `auxin-manifest.json`. Emitted at build time. Shipped alongside the agent.
   in new code; the collector may keep tolerant aliases for one version.
 - **`livenessEvidence` (C50) is the test-liveness gate and is FAIL-CLOSED.** The agent sets it true
   only when `environment` is an explicitly production-classified value. Unset or unrecognised =>
-  `false`. A window with `livenessEvidence: false`, or `testRunnerDetected: true`, is **discarded at
-  ingest and counted** — never used as evidence that code is alive. Without this the product
-  inverts: every *tested* method looks alive forever, so only *untested* code could ever be deleted.
+  `false`. Without this gate the product inverts: every *tested* method looks alive forever, so only
+  *untested* code could ever be deleted.
+
+  **AMENDED by BUG #22b (field trial).** This previously said such a window is *"discarded at ingest
+  and counted"*, and that was the single biggest barrier to anyone trying auxin: with
+  `ax.environment` unset the collector 403'd **every** window, so a first run looked like total
+  failure. Verbatim from the trial: *"I got 0 windows stored and had to mislabel a laptop as
+  production to see anything."*
+
+  A non-production window is now **stored, counted and explained** — and the safety property is
+  **moved, not removed**. It must be withheld in **BOTH directions**, which is four merges, not one:
+
+  | withheld | because it is evidence |
+  |---|---|
+  | `merge_coverage` | an observed probe => LIVE |
+  | `merge_probes_installed` | decides whether an unset bit is *death* evidence (#18) |
+  | `class_loaded` | its presence removes the C10 `class-never-loaded` blocker |
+  | `record_edges` | an observed inbound edge => LIVE |
+
+  The last two are the subtle half and the reason to spell this out: they make a `DEAD_CANDIDATE`
+  **more** likely, so **a laptop that merely loaded a class could otherwise help manufacture a dead
+  candidate for it.** Withholding only liveness would have left the dangerous direction open.
+
+  Tier-2 telemetry (calls, errors, percentiles, exception classes) **is** stored from such a window:
+  no rule reads it, so it cannot reach a verdict, and it is what lets a first-time user see the
+  thing working. `testRunnerDetected: true` is still a hard reject — #22b softens only the liveness
+  half. `--reject-unclassified` restores the old 403; `--allow-environments` extends the allowlist.
+### `agentHealth` additions (v4, additive)
+- **`tier2TimingMode`**: `full | sampled | disabled` (BUG #25). The field trial found the clock
+  decision flipping between boots on one machine, and — worse — that its consequence was invisible.
+  **`calls` and `errors` are counted EXACTLY in all three modes**; only the latency buckets are
+  lost. *"The difference between 'tier-2 is dead on this host' and 'you still get counts'."*
+- **`edgesStarvedOfSamples`** (BUG #26): the edge tier is armed but sampled zero roots this window,
+  while tier-2 saw real calls. `tierArmed: true` with no edges reads as broken; this says why.
+
+### >>> BUG #30: a slow clock must NOT degrade the window
+`clockDegraded` used to call `Health.degrade(...)`, and `degraded: true` discards the **whole**
+window as death evidence. But a slow clock affects **only the latency buckets** — coverage bits and
+call counts never touch the clock.
+
+Worse than over-broad. The field trial showed the clock decision is jittery near its threshold
+(*"same machine, two boots: one disabled, the next sampled"*), so the coupling made **a boot-to-boot
+coin flip silently discard a whole window's COVERAGE** — the substrate the entire dead-code verdict
+rests on. Non-deterministic evidence loss for an unrelated reason.
+
+Decoupled. Nothing is hidden: `clockNs`, `clockDegraded` and `tier2TimingMode` all still ship, so a
+reader sees exactly what was lost — the percentiles, and only the percentiles. Same reasoning that
+keeps `edgeTierFailures` out of `degraded`.
+
+### >>> contract v4: `errorsByClass` + the per-window name table (BUG #24)
+Field-trial finding: `Tier2Aggregator.MethodStats` keeps `errorCounts[]` by class id and `ErrorIds`
+maintains the name table (1-254, 255 = overflow) -- but `Batch.java` wrote only the **scalar**
+`errors`, and `decode.py` read only that. `grep -rn errorClass modules/ax-server/src/` returned
+**zero hits**. So the README's *"what does it throw -- exception class names"* was never delivered:
+you got a count, not a type. The data existed in the agent and was thrown away at the wire.
+
+**Both halves of this change implement to THIS spec, not to each other.** That rule exists because
+six bugs (#17, #18, #19, #21, #22, #23) were seams where each side was verified against a stand-in.
+
+Per window, one shared name table (ids are window-local, NOT stable across windows):
+```json
+"errorClasses": {"1": "java.net.SocketTimeoutException", "2": "java.lang.NullPointerException",
+                 "255": "<overflow>"},
+"tier2": [{"class": "...OrderHandler", "idx": 3, "calls": 1201, "errors": 3,
+           "errorsByClass": {"1": 2, "2": 1},
+           "buckets": [0,0,14,881,306,0]}]
+```
+Rules, and a reader MUST enforce every one:
+- `errorClasses` is **window-local**: id 1 in one window is unrelated to id 1 in the next. A reader
+  resolves ids **within the window that carried them** and stores names, never ids.
+- `sum(errorsByClass.values())` **may be less than** `errors`: the table holds 254 distinct classes
+  and id **255 is the overflow bucket**, and `errors` is incremented unconditionally. A reader must
+  never "reconcile" the difference by inventing a class -- report the remainder as unattributed.
+- `errorsByClass` absent or empty with `errors > 0` is **legal** (an older agent, or the id table
+  unavailable). Report `errors` and an explicit "types unavailable" -- never zero types.
+- `errorClasses` keys are JSON strings (JSON has no integer keys). Parse to int; reject non-numeric.
+- `schemaVersion` stays **2**: additive, and a reader that ignores unknown keys is unaffected.
+
 - **Never send a percentile.** Buckets only; percentiles are computed in `gt-collector` (C31).
 
 ### `edges[]` — the sampled runtime call-edge tier (SCOPE-v3, additive)

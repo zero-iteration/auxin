@@ -60,6 +60,10 @@ def test_tools_list_exposes_the_query_surface(mcp):
         "gt_callees_of",
         "gt_blast_radius",
         "gt_hot_paths",
+        # Bug #24: exception CLASS NAMES, not just an error count.
+        "gt_exception_classes",
+        # Bug #28: the default suppression list must be listable.
+        "gt_suppressions",
     }
 
 

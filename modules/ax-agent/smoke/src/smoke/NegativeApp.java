@@ -1,6 +1,9 @@
 package smoke;
 
 import io.auxin.agent.AuxinAgent;
+import io.auxin.agent.util.Json;
+
+import java.util.Map;
 
 /**
  * Fail-open probe. Runs the same target methods under broken/absent configuration and reports
@@ -22,6 +25,30 @@ public class NegativeApp {
             System.out.println("EDGEFAIL_BEFORE=" + before.root(3));
             AuxinAgent.edgesForceFailOpen("negative-suite fail-open drill");
             System.out.println("EDGEFAIL_AFTER=" + before.root(3));
+        }
+        if (args.length > 0 && "autorate".equals(args[0])) {
+            // ax.edges.sample.rate=auto (BUG #26). 4096 root entries per window against a target
+            // of ~20 sampled roots gives 4096/20 = 204, rounded DOWN to the power of two 128 --
+            // and it gets there in ONE window, because the estimate is the window's exact
+            // tier-2 call count and not a function of the divisor it is about to set.
+            //
+            // Printed per window rather than asserted here: the window a rate was in force for
+            // is the window that reports it, so the convergence is only visible as a sequence.
+            EdgeTarget e = new EdgeTarget();
+            for (int window = 0; window < 3; window++) {
+                for (int i = 0; i < 4096; i++) {
+                    if (e.root(1) != 10) {
+                        System.out.println("AUTORATE_BROKEN_AT=" + i);
+                        break;
+                    }
+                }
+                Map<String, Object> h = Json.asObject(
+                        Json.asObject(Json.parse(AuxinAgent.flushNow())).get("agentHealth"));
+                System.out.println("AUTORATE_W" + window + "="
+                        + Json.num(h, "edgesSampleRate", -1)
+                        + " sampledRoots=" + Json.num(h, "edgesSampledRoots", -1)
+                        + " starved=" + h.get("edgesStarvedOfSamples"));
+            }
         }
         if (args.length > 0 && "edgeflood".equals(args[0])) {
             // the same contract for the edge ring, which is a second Ring and therefore has its

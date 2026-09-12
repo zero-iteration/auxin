@@ -16,6 +16,9 @@ from ax_server.collector.known_methods import UNCHECKED, KnownMethods
 from ax_server.collector.testrunner import TestRunnerDetector
 from ax_server.store.bitset import BitsetDecodeError, decode_b64
 from ax_server.store.models import (
+    ERROR_TYPES_LEGACY,
+    ERROR_TYPES_UNAVAILABLE,
+    ERRORS_BY_CLASS,
     AgentHealth,
     CoverageRecord,
     EdgeHealth,
@@ -24,7 +27,13 @@ from ax_server.store.models import (
     Tier2Record,
 )
 
-__all__ = ["decode_window"]
+__all__ = ["decode_error_classes", "decode_window"]
+
+#: CONTRACTS 2 v4: the agent's id table holds 1-254 distinct classes and 255 is
+#: the overflow bucket. Ids outside that range are not a bucket we know how to
+#: read, so they are refused rather than guessed at.
+MIN_ERROR_CLASS_ID = 1
+OVERFLOW_ERROR_CLASS_ID = 255
 
 
 def _require(payload: Mapping[str, Any], key: str) -> Any:
@@ -142,6 +151,14 @@ def _agent_health(payload: Mapping[str, Any]) -> AgentHealth:
         clock_degraded=bool(raw.get("clockDegraded", False)),
         degraded=bool(raw.get("degraded", False)),
         strip_mask_missing=_strip_mask_missing(raw),
+        # CONTRACTS 2 pins these two spellings as CANONICAL. `livenessEvidence`
+        # stays TRI-STATE: absent means a pre-C50 agent said nothing, and that
+        # must not be read as an assertion either way -- only an explicit
+        # `false` withdraws the window (see `decode_window`).
+        liveness_evidence=(
+            None if raw.get("livenessEvidence") is None else bool(raw["livenessEvidence"])
+        ),
+        test_runner_detected=bool(raw.get("testRunnerDetected", False)),
         raw=dict(raw),
     )
 
@@ -207,7 +224,127 @@ def _coverage(
     return tuple(out), discarded
 
 
-def _tier2(raw: Any) -> tuple[Tier2Record, ...]:
+def _error_class_id(key: Any, where: str) -> int:
+    """Parse one JSON object key as a CONTRACTS 2 v4 error-class id.
+
+    "`errorClasses` keys are JSON strings (JSON has no integer keys). Parse to
+    int; reject non-numeric." A key we cannot parse is REFUSED rather than
+    skipped: skipping it would silently drop the counts filed under it, and
+    those counts are the only record that those exceptions happened at all.
+    """
+    if isinstance(key, bool) or not isinstance(key, (str, int)):
+        raise IngestRejected(
+            RejectReason.BAD_ERROR_CLASS_ID,
+            f"{where} key {key!r} is not a string; CONTRACTS 2 v4 ids are JSON string keys",
+        )
+    text = str(key).strip()
+    if not text or not (text.isascii() and text.isdigit()):
+        raise IngestRejected(
+            RejectReason.BAD_ERROR_CLASS_ID,
+            f"{where} key {key!r} is not numeric; CONTRACTS 2 v4 requires the id to parse "
+            "as an int and refuses a non-numeric key rather than guessing at it",
+        )
+    value = int(text)
+    if not (MIN_ERROR_CLASS_ID <= value <= OVERFLOW_ERROR_CLASS_ID):
+        raise IngestRejected(
+            RejectReason.BAD_ERROR_CLASS_ID,
+            f"{where} key {value} is outside the CONTRACTS 2 v4 id space "
+            f"({MIN_ERROR_CLASS_ID}-254, {OVERFLOW_ERROR_CLASS_ID} = overflow)",
+        )
+    return value
+
+
+def decode_error_classes(payload: Mapping[str, Any]) -> dict[int, str]:
+    """CONTRACTS 2 v4 `errorClasses` -- the WINDOW-LOCAL id -> name table.
+
+    "`errorClasses` is window-local: id 1 in one window is unrelated to id 1
+    in the next. A reader resolves ids WITHIN THE WINDOW that carried them and
+    stores names, never ids."
+
+    That sentence is the entire reason this function exists as a separate step
+    before `_tier2`: the table is decoded once per window and handed to the
+    per-record decoder, so there is no code path in which a record from window
+    N can be resolved against the table from window N+1. Absent or empty is
+    legal -- then every id is unresolvable and every error is unattributed.
+    """
+    raw = payload.get("errorClasses")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise IngestRejected(
+            RejectReason.BAD_FIELD,
+            "errorClasses must be an object of {\"<id>\": \"<class name>\"} (CONTRACTS 2 v4)",
+        )
+    table: dict[int, str] = {}
+    for key, name in raw.items():
+        ident = _error_class_id(key, "errorClasses[]")
+        if not isinstance(name, str) or not name.strip():
+            raise IngestRejected(
+                RejectReason.BAD_FIELD,
+                f"errorClasses[{key!r}] must be a non-empty class name string",
+            )
+        table[ident] = name.strip()
+    return table
+
+
+def _errors_by_class(
+    entry: Mapping[str, Any], table: Mapping[int, str], where: str
+) -> tuple[dict[str, int], int, str]:
+    """Resolve one record's `errorsByClass` against THIS window's name table.
+
+    Returns `(name -> count, unresolved_id_errors, source)`.
+
+    Three rules from CONTRACTS 2 v4 are implemented here and nowhere else:
+
+    * ids are resolved against `table` -- the table from the window that
+      carried them -- and only NAMES come out;
+    * an id the table does not name is NOT given an invented name. Its count
+      becomes `unresolved_id_errors`, which the caller reports as
+      unattributed, because "we know these happened but not what they were"
+      is a fact and "they were java.lang.Something" is a fabrication;
+    * absent or empty with `errors > 0` is legal and yields source
+      `unavailable`, which downstream renders as "types unavailable" -- never
+      as zero types.
+    """
+    raw = entry.get("errorsByClass")
+    if raw is None:
+        legacy = entry.get("errorTypes")
+        if isinstance(legacy, Mapping) and legacy:
+            # The pre-v4 shape: names already spelled out. Kept readable so a
+            # deployed agent on the old wire is not silently stripped of its
+            # exception types -- the same "tolerant for one version" stance
+            # CONTRACTS 2 takes on the environment spelling.
+            return ({str(k): int(v) for k, v in legacy.items()}, 0, ERROR_TYPES_LEGACY)
+        return ({}, 0, ERROR_TYPES_UNAVAILABLE)
+    if not isinstance(raw, Mapping):
+        raise IngestRejected(
+            RejectReason.BAD_FIELD, f"{where}.errorsByClass must be an object of id -> count"
+        )
+    if not raw:
+        # An EMPTY object is explicitly legal with `errors > 0` (CONTRACTS 2
+        # v4). It is reported as "types unavailable", not as "no exceptions".
+        return ({}, 0, ERROR_TYPES_UNAVAILABLE)
+    counts: dict[str, int] = {}
+    unresolved = 0
+    for key, value in raw.items():
+        ident = _error_class_id(key, f"{where}.errorsByClass[]")
+        count = _as_int(value, f"{where}.errorsByClass[{key!r}]")
+        if count < 0:
+            raise IngestRejected(
+                RejectReason.BAD_FIELD,
+                f"{where}.errorsByClass[{key!r}] is a raw count and cannot be negative",
+            )
+        name = table.get(ident)
+        if name is None:
+            unresolved += count
+            continue
+        counts[name] = counts.get(name, 0) + count
+    return (counts, unresolved, ERRORS_BY_CLASS)
+
+
+def _tier2(
+    raw: Any, *, error_classes: Mapping[int, str], health: IngestHealth
+) -> tuple[Tier2Record, ...]:
     if raw is None:
         return ()
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
@@ -233,20 +370,40 @@ def _tier2(raw: Any) -> tuple[Tier2Record, ...]:
                 RejectReason.BAD_FIELD,
                 "tier2[] carries a percentile; the agent must send buckets only (CONTRACTS 2)",
             )
-        error_types_raw = entry.get("errorTypes") or {}
-        if not isinstance(error_types_raw, Mapping):
+        if entry.get("errorTypes") is not None and not isinstance(
+            entry.get("errorTypes"), Mapping
+        ):
             raise IngestRejected(RejectReason.BAD_FIELD, "tier2[].errorTypes must be an object")
-        out.append(
-            Tier2Record(
-                cls=_as_str(entry.get("class"), "tier2[].class"),
-                idx=_as_int(entry.get("idx"), "tier2[].idx"),
-                calls=int(entry.get("calls", 0) or 0),
-                errors=int(entry.get("errors", 0) or 0),
-                error_types={str(k): int(v) for k, v in error_types_raw.items()},
-                buckets=tuple(int(b) for b in buckets_raw),
-                bucket_scheme=scheme,
-            )
+        cls = _as_str(entry.get("class"), "tier2[].class")
+        idx = _as_int(entry.get("idx"), "tier2[].idx")
+        errors = int(entry.get("errors", 0) or 0)
+        named, unresolved, source = _errors_by_class(
+            entry, error_classes, f"tier2[{cls}#{idx}]"
         )
+        record = Tier2Record(
+            cls=cls,
+            idx=idx,
+            calls=int(entry.get("calls", 0) or 0),
+            errors=errors,
+            error_types=named,
+            buckets=tuple(int(b) for b in buckets_raw),
+            bucket_scheme=scheme,
+            error_types_source=source,
+            unresolved_id_errors=unresolved,
+        )
+        # Every way the breakdown can fall short of `errors` is COUNTED here
+        # and never reconciled. CONTRACTS 2 v4 forbids inventing a class to
+        # close the gap; the gap itself is the honest answer, and an operator
+        # who can see it is an operator who can ask the agent for a bigger
+        # table instead of chasing a phantom accounting bug.
+        health.note_tier2_errors(
+            errors=errors,
+            attributed=record.attributed_errors,
+            unattributed=record.unattributed_errors,
+            unresolved_ids=unresolved,
+            types_available=record.error_types_available,
+        )
+        out.append(record)
     return tuple(out)
 
 
@@ -363,9 +520,44 @@ def decode_window(
 
     agent_health = _agent_health(payload)
 
+    # -- the C50 evidence gate (BUG #22b) ------------------------------
+    #
+    # BEFORE: `if not classification.production: raise 403`. That refused the
+    # whole window, including its coverage, and it was the single biggest
+    # barrier to anyone trying the product -- an unset `ax.environment` meant
+    # every window 403'd and the user saw total failure with no data at all.
+    #
+    # NOW: store and mark. `production` / `liveness_evidence` ride on the
+    # window, `Window.usable_as_death_evidence` and `usable_as_life_evidence`
+    # keep excluding it, and `CollectorService` withholds every merge that
+    # would turn it into evidence. The safety property is unchanged; only the
+    # cliff is gone. `--reject-unclassified` puts the cliff back.
+    #
+    # The two halves are combined FAIL-CLOSED: either the collector's own
+    # classification or the agent's `livenessEvidence` saying no is enough.
     classification = policy.classify(payload)
-    if not classification.production:
+    production = classification.production
+    if agent_health.liveness_evidence is False:
+        # The agent explicitly disclaimed its own window. Believe it even if
+        # the label is allowlisted -- it knows things we do not (it is the one
+        # that saw `ax.environment` unset in the first place).
+        production = False
+    if not production and policy.reject_non_production:
         raise IngestRejected(RejectReason.NOT_PRODUCTION, classification.reason, status=403)
+
+    # CONTRACTS 2: "A window with `livenessEvidence: false`, or
+    # `testRunnerDetected: true`, is discarded at ingest and counted." The
+    # first half is what bug #22b softens to store-and-mark; the second half is
+    # a positive assertion by the agent that a test harness is running in this
+    # JVM, which is C50.3 and stays a refusal, exactly as a test-runner frame
+    # in `classesLoaded` does.
+    if agent_health.test_runner_detected:
+        raise IngestRejected(
+            RejectReason.TEST_RUNNER_WINDOW,
+            "agentHealth.testRunnerDetected is true; a test run is not a liveness "
+            "signal and its coverage must never be merged (C50.3, CONTRACTS 2)",
+            status=403,
+        )
 
     classes_loaded_raw = payload.get("classesLoaded") or []
     if not isinstance(classes_loaded_raw, Sequence) or isinstance(classes_loaded_raw, (str, bytes)):
@@ -384,7 +576,11 @@ def decode_window(
         )
 
     coverage, discarded = _coverage(payload.get("coverage"), detector, health)
-    tier2 = _tier2(payload.get("tier2"))
+    # The name table is decoded FROM THIS BODY and handed straight to the
+    # per-record decoder, so a record can only ever be resolved against the
+    # table that travelled with it (CONTRACTS 2 v4: ids are window-local).
+    error_classes = decode_error_classes(payload)
+    tier2 = _tier2(payload.get("tier2"), error_classes=error_classes, health=health)
     edges, edges_present, edges_verified = _edges(
         payload.get("edges"), build_sha=build_sha, known=known
     )
@@ -412,7 +608,11 @@ def decode_window(
         edges=edges,
         edges_present=edges_present,
         environment=classification.environment,
-        production=classification.production,
+        production=production,
+        # Bug #22b: persisted as the contract names it. False here is the whole
+        # point -- the row exists, the user can see it, and nothing in it is
+        # evidence.
+        liveness_evidence=production,
         test_tainted=False,
         test_markers=(),
     )

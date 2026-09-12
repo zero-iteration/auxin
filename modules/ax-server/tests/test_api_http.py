@@ -87,17 +87,29 @@ def test_builds(api):
 # -- HTTP ---------------------------------------------------------------
 
 
-@pytest.fixture
-def server(store, collector, engine):
+def _serve(collector, engine):
     api = QueryService(engine, collector=collector)
     router = Router().extend(make_collector_router(collector)).extend(make_api_router(api))
     httpd = serve(router, port=0)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    yield f"http://127.0.0.1:{httpd.server_address[1]}"
-    httpd.shutdown()
-    httpd.server_close()
-    thread.join(timeout=5)
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def server(store, collector, engine):
+    yield from _serve(collector, engine)
+
+
+@pytest.fixture
+def strict_server(store, strict_collector, engine):
+    """The same stack in `--reject-unclassified` mode (bug #22b)."""
+    yield from _serve(strict_collector, engine)
 
 
 def _get(base, path):
@@ -127,7 +139,14 @@ def test_http_ingest_then_query(server):
     assert len(windows["usable"]) == 1
 
 
-def test_http_rejects_an_unclassified_jvm_with_403(server):
+def test_http_rejects_an_unclassified_jvm_with_403(strict_server):
+    """`--reject-unclassified` still answers 403 over HTTP (bug #22b).
+
+    Retargeted from the default `server` fixture, with the assertions
+    unchanged: the default now answers 202 and marks the window, which
+    `test_non_production_windows.py` pins over HTTP too.
+    """
+    server = strict_server
     body = realistic_payload(0)
     del body["jvmClassification"]
     req = urllib.request.Request(

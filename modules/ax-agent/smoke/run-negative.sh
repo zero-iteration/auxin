@@ -298,6 +298,108 @@ expect "app still correct"        "APP_OK=true"                        "$o"
 expect "warned about the value"   "unknown value for ax.bridge.shape"  "$o"
 expect "fell back to the default" "bridgeShape=selfbsm"                "$o"
 
+# ---- BUG #24: the exception CLASS NAME on the wire (CONTRACTS section 2 v4) -----------------
+# Every run above already produced one classified error: NegativeApp's ok-chain lets an
+# IllegalStateException out of EdgeTarget.throwingRoot, which is a tier-2 boundary method. Until
+# v4 the wire said only `"errors": 1` -- the name was in ErrorIds and the per-class count was in
+# MethodStats.errorCounts, and neither reached the collector in a form a reader could resolve.
+# `grep -rn errorClass modules/ax-server/src/` returned zero hits.
+o="$(run 'errorsByClass + errorClasses (contract v4)' -Dax.include.packages=smoke -Dax.manifest="$MF")"
+expect "app still correct"        "APP_OK=true"        "$o"
+jsonexpect "the window carries an errorClasses table at the top level" \
+    'isinstance(w.get("errorClasses"), dict)' "$o"
+jsonexpect "a thrown IllegalStateException reaches the wire as a NAME, resolved through that table" \
+    'any(w["errorClasses"].get(k) == "java.lang.IllegalStateException" for r in w["tier2"] for k in (r.get("errorsByClass") or {}))' "$o"
+jsonexpect "every errorsByClass key is a numeric string present in THIS window's table" \
+    'all(k.isdigit() and k in w["errorClasses"] for r in w["tier2"] for k in (r.get("errorsByClass") or {}))' "$o"
+jsonexpect "sum(errorsByClass) <= errors in every record (the slack is one-directional)" \
+    'all(sum((r.get("errorsByClass") or {}).values()) <= r["errors"] for r in w["tier2"])' "$o"
+# Absent, not empty: "types unavailable" and "no types" are different facts, and a reader is
+# required to render the first one as such rather than as zero types.
+jsonexpect "errorsByClass is ABSENT from a record that had no errors, never an empty object" \
+    'all("errorsByClass" not in r for r in w["tier2"] if r["errors"] == 0)' "$o"
+jsonexpect "the table holds ONLY the ids this window's records reference" \
+    'set(w["errorClasses"]) == set(k for r in w["tier2"] for k in (r.get("errorsByClass") or {}))' "$o"
+
+# ---- BUG #25: the timing mode is configurable, and its consequence is on the wire ----------
+# The field report was the same machine classifying itself `disabled` on one boot and `sampled`
+# on the next. The thresholds are now configuration, which is also the only way to assert all
+# three modes on a host whose clock is healthy.
+o="$(run 'clock thresholds: forced FULL' -Dax.include.packages=smoke -Dax.manifest="$MF" -Dax.clock.sampled.threshold.ns=1000000 -Dax.clock.disabled.threshold.ns=1000000)"
+expect "app still correct"          "APP_OK=true"          "$o"
+expect "startup line carries the mode" "tier2TimingMode=full" "$o"
+expect "and what the mode costs"    "latency buckets all recorded" "$o"
+jsonexpect "agentHealth.tier2TimingMode == full" 'h["tier2TimingMode"] == "full"' "$o"
+jsonexpect "latency buckets are populated when timing is on" \
+    'any(sum(r["buckets"]) > 0 for r in w["tier2"])' "$o"
+
+o="$(run 'clock thresholds: forced SAMPLED' -Dax.include.packages=smoke -Dax.manifest="$MF" -Dax.clock.sampled.threshold.ns=0)"
+expect "app still correct"          "APP_OK=true"          "$o"
+expect "startup line carries the mode" "tier2TimingMode=sampled" "$o"
+expect "warned, and said counts are unaffected" "calls and errors still counted EXACTLY" "$o"
+jsonexpect "agentHealth.tier2TimingMode == sampled" 'h["tier2TimingMode"] == "sampled"' "$o"
+jsonexpect "calls and errors are still recorded exactly under sampled timing" \
+    'sum(r["calls"] for r in w["tier2"]) > 0 and sum(r["errors"] for r in w["tier2"]) >= 1' "$o"
+jsonexpect "and sampled timing does NOT degrade the window" 'h["degraded"] is False' "$o"
+
+# THE assertion the field report asked for: with timing off, tier-2 still counts and still
+# classifies. "tier-2 is dead on this host" vs "you still get counts".
+o="$(run 'clock thresholds: forced DISABLED' -Dax.include.packages=smoke -Dax.manifest="$MF" -Dax.clock.sampled.threshold.ns=0 -Dax.clock.disabled.threshold.ns=0)"
+expect "app still correct"          "APP_OK=true"          "$o"
+expect "startup line carries the mode" "tier2TimingMode=disabled" "$o"
+expect "said what is actually lost"  "only the latency buckets are lost" "$o"
+expect "and named the property that pins it" "ax.clock.disabled.threshold.ns" "$o"
+jsonexpect "agentHealth.tier2TimingMode == disabled" 'h["tier2TimingMode"] == "disabled"' "$o"
+jsonexpect "CALLS AND ERRORS ARE STILL RECORDED with timing disabled" \
+    'sum(r["calls"] for r in w["tier2"]) > 0 and sum(r["errors"] for r in w["tier2"]) >= 1' "$o"
+jsonexpect "and the error is still CLASSIFIED by name with no usable clock at all" \
+    'any(w["errorClasses"].get(k) == "java.lang.IllegalStateException" for r in w["tier2"] for k in (r.get("errorsByClass") or {}))' "$o"
+jsonexpect "only the latency buckets are empty" \
+    'all(sum(r["buckets"]) == 0 for r in w["tier2"])' "$o"
+jsonexpect "clockDegraded agrees with the mode" 'h["clockDegraded"] is True' "$o"
+
+o="$(run 'inverted clock thresholds (sampled > disabled)' -Dax.include.packages=smoke -Dax.manifest="$MF" -Dax.clock.sampled.threshold.ns=500 -Dax.clock.disabled.threshold.ns=0)"
+expect "app still correct"          "APP_OK=true"          "$o"
+expect "warned about the inversion" "would make the disabled band unreachable" "$o"
+jsonexpect "and the STRICTER of the two won: an operator who inverts them does not quietly get full timing" \
+    'h["tier2TimingMode"] == "disabled"' "$o"
+
+# ---- BUG #26: an armed edge tier that has sampled nothing must say which of the two it is ---
+# ax.edges.sample.rate=1024 at development volume yields zero edges while edgesEnabled says the
+# tier is on. That reads as a broken feature; it is arithmetic.
+o="$(run 'edges armed at the production 1-in-1024, dev-volume traffic' -Dax.include.packages=smoke -Dax.manifest="$MF" -Dax.edges.enabled=true)"
+expect "app still correct"            "APP_OK=true"          "$o"
+expect "edge tier armed"              "EDGES=true"           "$o"
+expect "said it is the RATE, not the application" "because of the RATE" "$o"
+expect "and named the flag that fixes it" "ax.edges.sample.rate=auto" "$o"
+jsonexpect "armed + roots entered + nothing sampled == edgesStarvedOfSamples on the wire" \
+    'h["edgesEnabled"] is True and h["edgesSampledRoots"] == 0 and w["edges"] == [] and h["edgesStarvedOfSamples"] is True' "$o"
+jsonexpect "which is a configuration fact, not a failure and not degraded" \
+    'h["degraded"] is False and h["edgeTierFailures"] == 0' "$o"
+
+o="$(run 'edges at rate=1: nothing is starved' -Dax.include.packages=smoke -Dax.manifest="$MF" -Dax.edges.enabled=true -Dax.edges.sample.rate=1)"
+expect "app still correct"            "APP_OK=true"          "$o"
+jsonexpect "roots were sampled, so the flag stays off" \
+    'h["edgesSampledRoots"] > 0 and h["edgesStarvedOfSamples"] is False' "$o"
+
+o="$(run 'edges off: an unarmed tier is never starved' -Dax.include.packages=smoke -Dax.manifest="$MF" -Dax.edges.enabled=false)"
+expect "app still correct"            "APP_OK=true"          "$o"
+jsonexpect "no edges and no starvation claim: the tier was never armed" \
+    'h["edgesEnabled"] is False and h["edgesStarvedOfSamples"] is False' "$o"
+
+APPARGS=autorate
+o="$(run 'ax.edges.sample.rate=auto converges on ~20 sampled roots per window' -Dax.include.packages=smoke -Dax.manifest="$MF" -Dax.edges.enabled=true -Dax.edges.sample.rate=auto)"
+unset APPARGS
+expect "app still correct"              "APP_OK=true"           "$o"
+expect "auto is announced in the summary" "edgesSampleRate=1024(auto)" "$o"
+expect "auto STARTS at the production default" "AUTORATE_W0=1024" "$o"
+expect "4096 roots/window -> 1-in-128 in ONE window" "AUTORATE_W1=128" "$o"
+expect "and it stays there (no oscillation)" "AUTORATE_W2=128"  "$o"
+expect "said so once, with the arithmetic" "retuned 1-in-1024 -> 1-in-128" "$o"
+jsonexpect "the converged rate is what the window reports" 'h["edgesSampleRate"] == 128' "$o"
+jsonexpect "and nothing is starved once it has converged" \
+    'h["edgesStarvedOfSamples"] is False and h["edgesSampledRoots"] > 20' "$o"
+
 echo
 if [ "$fails" -gt 0 ]; then echo "== NEGATIVE TESTS FAILED: $fails =="; exit 1; fi
 echo "== NEGATIVE TESTS PASSED =="

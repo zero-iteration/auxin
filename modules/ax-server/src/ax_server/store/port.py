@@ -19,6 +19,7 @@ __all__ = [
     "IngestAudit",
     "ProbeInstallStore",
     "Store",
+    "Tier2ErrorStore",
     "WindowAttribution",
 ]
 
@@ -195,6 +196,56 @@ class ProbeInstallStore(ABC):
 
         A class absent from the mapping never reported a mask; a class present
         with an all-zero value reported that it installed nothing.
+        """
+
+
+class Tier2ErrorStore(ABC):
+    """OPTIONAL port extension, not part of CONTRACTS 3 -- the exception-class
+    breakdown (`errorsByClass` + `errorClasses`, bug #24).
+
+    A port extension for the same reason `EdgeStore` and `ProbeInstallStore`
+    are: CONTRACTS 3's eight signatures are frozen and a test pins the set. An
+    adapter that does not implement this simply has no breakdown, and callers
+    feature-detect with `isinstance`.
+
+    Two rules every implementation must honour, both from CONTRACTS 2 v4:
+
+    * **Names, never ids.** `errorClasses` is window-local -- id 1 in one
+      window is unrelated to id 1 in the next -- so ids are resolved at decode
+      and only names reach this port. There is deliberately no method here
+      that takes or returns an id.
+    * **The remainder is reported, never reconciled.** `sum(errorsByClass)`
+      may be less than `errors` (254-class table, id 255 = overflow, `errors`
+      counted unconditionally). `unattributed` carries that shortfall so a
+      caller can print it; no implementation may scale the named counts up to
+      close the gap or invent a class to absorb it.
+    """
+
+    @abstractmethod
+    def tier2_error_classes(
+        self, build_sha: str, cls: str, idx: int, since: datetime
+    ) -> dict[str, object]:
+        """Exception classes for ONE `(cls, idx)` since `since`.
+
+        Returns at least:
+            `byClass`      `{class name: count}`, summed across windows
+            `attributed`   sum of `byClass`
+            `unattributed` `errors - attributed`, the legal remainder
+            `errors`       the unconditional total
+            `source`       which wire shape the names came from, or
+                           `unavailable` when no breakdown ever arrived
+        """
+
+    @abstractmethod
+    def error_class_totals(
+        self, build_sha: str, since: datetime, limit: int = 20
+    ) -> dict[str, object]:
+        """"Top exception classes for this build" -- the same shape, build-wide.
+
+        Ranked by count, capped by `limit`. The `unattributed` total is
+        returned alongside the ranking and is NOT an entry in it: it has no
+        class name, and giving it one would be the fabrication the contract
+        forbids.
         """
 
 

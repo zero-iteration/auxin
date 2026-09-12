@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- Standalone on purpose, exactly like ax-agent: no parent that could drag in a
+       dependency. Runtime deps are shaded ASM ONLY.
+
+       ALSO standalone on purpose in the other sense: this module does NOT depend on
+       ax-agent, is NOT loaded by it, and ships as its OWN -javaagent. That separation is
+       the whole point; see TRADE-OFFS.md. The per-request tracer gives up invariants
+       ax-agent guarantees, so it must not be able to leak into ax-agent's tiers by
+       sharing a jar, a switch or a transformer with them. -->
+  <groupId>io.auxin</groupId>
+  <artifactId>ax-trace</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+  <name>ax-trace</name>
+  <description>auxin per-request tracer: conditional, deep, value-bearing capture of ONE request</description>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Same baseline as ax-agent: the tracer attaches to JDK 8+ hosts. -->
+    <maven.compiler.release>8</maven.compiler.release>
+    <asm.version>9.7.1</asm.version>
+    <premain.class>io.auxin.trace.TraceAgent</premain.class>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.ow2.asm</groupId>
+      <artifactId>asm</artifactId>
+      <version>${asm.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.ow2.asm</groupId>
+      <artifactId>asm-tree</artifactId>
+      <version>${asm.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>ax-trace</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.5.0</version>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <Premain-Class>${premain.class}</Premain-Class>
+              <!-- FALSE, deliberately, and it is the honest encoding of the trade in
+                   TRADE-OFFS.md: a trace probe can never be stripped, because you cannot
+                   know in advance which request will be traced. There is nothing for this
+                   agent to retransform, so it does not ask for the capability. -->
+              <Can-Retransform-Classes>false</Can-Retransform-Classes>
+              <Can-Redefine-Classes>false</Can-Redefine-Classes>
+              <Can-Set-Native-Method-Prefix>false</Can-Set-Native-Method-Prefix>
+              <Implementation-Title>auxin-trace</Implementation-Title>
+              <Implementation-Version>${project.version}</Implementation-Version>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <shadedArtifactAttached>false</shadedArtifactAttached>
+              <relocations>
+                <relocation>
+                  <pattern>org.objectweb.asm</pattern>
+                  <!-- A DIFFERENT shaded package from ax-agent's io.auxin.shaded.asm, so that
+                       running both agents in one JVM cannot have one's ASM version satisfy the
+                       other's. Two copies of ASM cost ~120KB of metaspace and buy independence. -->
+                  <shadedPattern>io.auxin.trace.shaded.asm</shadedPattern>
+                </relocation>
+              </relocations>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>module-info.class</exclude>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>META-INF/maven/**</exclude>
+                    <exclude>META-INF/versions/**</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <manifestEntries>
+                    <Premain-Class>${premain.class}</Premain-Class>
+                    <Can-Retransform-Classes>false</Can-Retransform-Classes>
+                    <Can-Redefine-Classes>false</Can-Redefine-Classes>
+                    <Can-Set-Native-Method-Prefix>false</Can-Set-Native-Method-Prefix>
+                    <Implementation-Title>auxin-trace</Implementation-Title>
+                    <Implementation-Version>${project.version}</Implementation-Version>
+                  </manifestEntries>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
