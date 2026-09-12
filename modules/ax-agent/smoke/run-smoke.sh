@@ -316,8 +316,23 @@ bcheck "edge tier: one new exception-table entry per root, and not one anywhere 
 # of the 6 new frames belongs to a root's handler; the other 6 methods gained none.
 bcheck "edge tier: exactly one new stack map frame per ROOT, none for any callee" \
     "$(( $(count "$EDGEOFF" 'frame_type') + 6 ))" "$(count "$EDGEON" 'frame_type')"
-bcheck "edge tier: the handler frame declares ZERO locals (nothing named, nothing to get wrong)" \
-    "6" "$(count "$EDGEON" 'locals = \[\]')"
+# SCOPE-v3.1 CHANGED THIS ASSERTION, AND THE NEW ONE IS STRICTLY STRONGER.
+#
+# It used to read "the handler frame declares ZERO locals (nothing named, nothing to get wrong)"
+# and expect 6 matches of `locals = []`. That was sound only while the edge tier was the LAST
+# thing emitted into a method, because an undeclared local is `top` and `top` is assignable-TO,
+# not assignable-FROM. The per-request trace tier is now emitted after the edge tier and its
+# handler range covers the edge handler block, so a zero-locals frame there produced exactly:
+#
+#   VerifyError: Type top (current frame, locals[0]) is not assignable to 'traceapp/SearchFilter'
+#
+# The frame now declares the receiver and the descriptor's arguments -- which cannot be got
+# wrong, because both come from the method's own signature. So: zero of the old shape, and six
+# of the honest one, named exactly rather than counted vaguely.
+bcheck "edge tier: NOT ONE handler frame erases locals[0] to top (the coexistence VerifyError)" \
+    "0" "$(count "$EDGEON" 'locals = \[\]')"
+bcheck "edge tier: every root's handler frame names the receiver and the descriptor's argument" \
+    "6" "$(count "$EDGEON" 'locals = \[ class smoke/EdgeTarget, int \]')"
 bcheck "edge tier: the callee adds NO local slot" \
     "$("$JAVAP" -v -p -c "$EDGEOFF" | awk '/public int level1\(int\)/,/public int level2/' \
         | grep -o 'locals=[0-9]*' | head -1)" \

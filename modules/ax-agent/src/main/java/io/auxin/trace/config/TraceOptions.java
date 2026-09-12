@@ -9,10 +9,19 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * All tracer configuration, under the {@code ax.trace.*} namespace so that no property of this
- * module can be confused with a property of ax-agent's tiers. Resolution order matches
- * ax-agent's (later wins): built-in default, {@code -javaagent} argument, system property
- * {@code ax.trace.*}, environment variable {@code AX_TRACE_*}.
+ * All tracer configuration, under the {@code ax.trace.*} namespace so that no property of the
+ * trace tier can be confused with a property of ax-agent's other tiers.
+ *
+ * <p>SCOPE-v3.1: this is parsed by {@link io.auxin.agent.config.Options}, from the SAME
+ * {@code -javaagent} argument map, so there is one premain, one argument string and one
+ * resolution order (later wins): built-in default, {@code -javaagent:ax-agent.jar=trace.k=v},
+ * system property {@code ax.trace.*}, environment variable {@code AX_TRACE_*} or
+ * {@code GT_TRACE_*}.
+ *
+ * <p>The agent's own kill switch is upstream of this one: {@code ax.enabled=false} disables the
+ * whole agent, tracer included, and {@link #enabled} is level two of the same three-level kill
+ * switch that carries {@code ax.tier1.enabled} / {@code ax.tier2.enabled} /
+ * {@code ax.edges.enabled}. Level three is the {@link TraceScope} exclude list.
  *
  * <h3>The master switch is OFF</h3>
  * {@link #enabled} defaults to <b>false</b> and nothing — not the servlet entry, not one probe —
@@ -28,11 +37,24 @@ public final class TraceOptions {
     /** The activation header. A header and not a query parameter — see TRACE-CONTRACT.md §1. */
     public static final String HEADER = "X-Auxin-Trace";
 
-    /** Refuse to arm the tracer while ax-agent's Tier-1b auto-strip covers the traced scope. */
+    /**
+     * The pre-merge default, kept reachable: refuse to arm the tracer at all while Tier-1b's
+     * auto-strip covers the traced scope. Nothing is instrumented and ax-agent keeps every
+     * property it promised.
+     */
     public static final String CONFLICT_REFUSE = "refuse";
-    /** Arm the tracer and turn Tier-1b off for this JVM, saying so in the startup line. */
+    /**
+     * THE DEFAULT since SCOPE-v3.1 (owner's decision: <i>"we can have one agent only, its fine
+     * if it adds overhead for some requests"</i>). Arm the tracer and disable Tier-1b's
+     * auto-strip <b>for the intersection of the traced and instrumented scopes only</b> --
+     * automatically, and loudly. A class outside the traced scope still strips normally.
+     */
     public static final String CONFLICT_DISABLE_STRIP = "disable-strip";
-    /** Arm both and accept that the traced classes never reach zero steady-state overhead. */
+    /**
+     * Arm both. Tier-1b strips traced classes too, which removes only the coverage probes and
+     * leaves the trace probes on the hot path: a true {@code classesStripped} counter and a
+     * false "overhead is now zero" conclusion. Opt-in, and reported on the wire.
+     */
     public static final String CONFLICT_ALLOW = "allow";
 
     /** Record every conditional. Honest, and unreadable on a real service. */
@@ -74,6 +96,9 @@ public final class TraceOptions {
     public final String projectionPath;
     public final List<String> redactAllow;
 
+    /** Extra {@code name(desc)} servlet-entry signatures (TRACE-CONTRACT.md section 1). */
+    public final List<String> entrySignatures;
+
     public final String stripConflict;
 
     public final boolean transportEnabled;
@@ -89,8 +114,10 @@ public final class TraceOptions {
     public final String dumpDir;
     public final int logLevel;
 
-    private TraceOptions(Map<String, String> a) {
-        this.logLevel = TLog.parseLevel(str(a, "log.level", ""), TLog.INFO);
+    private TraceOptions(Map<String, String> a, int agentLogLevel) {
+        // One agent, one log level by default: ax.log.level governs both unless ax.trace.log.level
+        // is set explicitly.
+        this.logLevel = TLog.parseLevel(str(a, "log.level", ""), agentLogLevel);
         TLog.setLevel(this.logLevel);
 
         this.enabled = bool(a, "enabled", false);          // MASTER SWITCH, DEFAULT OFF
@@ -123,8 +150,12 @@ public final class TraceOptions {
 
         this.projectionPath = str(a, "projection", "");
         this.redactAllow = list(a, "redact.allow");
+        this.entrySignatures = list(a, "entry.signatures");
 
-        this.stripConflict = oneOf(a, "strip.conflict", CONFLICT_REFUSE,
+        // SCOPE-v3.1: disable-strip is the default. The trade is TAKEN, not refused -- but it
+        // is taken narrowly (the scope intersection, not the JVM) and loudly (a premain WARN, a
+        // startup-summary field and tier1bDisabledByTrace on the wire).
+        this.stripConflict = oneOf(a, "strip.conflict", CONFLICT_DISABLE_STRIP,
                 CONFLICT_REFUSE, CONFLICT_DISABLE_STRIP, CONFLICT_ALLOW);
 
         this.transportEnabled = bool(a, "transport.enabled", true);
@@ -170,15 +201,22 @@ public final class TraceOptions {
         this.dumpDir = str(a, "dump.dir", "");
     }
 
-    public static TraceOptions parse(String agentArgs) {
+    /**
+     * Parsed from the ONE agent argument map {@link io.auxin.agent.config.Options} already
+     * built. A trace key appears there under a {@code trace.} prefix --
+     * {@code -javaagent:ax-agent.jar=include.packages=com.acme,trace.enabled=true} -- which is
+     * the same shape as the system property ({@code ax.include.packages} /
+     * {@code ax.trace.enabled}) and needs no second argument string.
+     */
+    public static TraceOptions parse(Map<String, String> agentArgs, int agentLogLevel) {
         Map<String, String> a = new LinkedHashMap<String, String>();
-        if (agentArgs != null && agentArgs.length() > 0) {
-            for (String kv : agentArgs.split(",")) {
-                int eq = kv.indexOf('=');
-                if (eq > 0) a.put(kv.substring(0, eq).trim(), kv.substring(eq + 1).trim());
+        if (agentArgs != null) {
+            for (Map.Entry<String, String> e : agentArgs.entrySet()) {
+                String k = e.getKey();
+                if (k != null && k.startsWith("trace.")) a.put(k.substring(6), e.getValue());
             }
         }
-        return new TraceOptions(a);
+        return new TraceOptions(a, agentLogLevel);
     }
 
     public boolean productionClassified() {
@@ -204,7 +242,9 @@ public final class TraceOptions {
     private static String raw(Map<String, String> a, String key) {
         String sys = System.getProperty("ax.trace." + key);
         if (sys != null) return sys;
-        String env = System.getenv("AX_TRACE_" + key.toUpperCase(Locale.ROOT).replace('.', '_'));
+        String suffix = key.toUpperCase(Locale.ROOT).replace('.', '_');
+        String env = System.getenv("AX_TRACE_" + suffix);
+        if (env == null) env = System.getenv("GT_TRACE_" + suffix);   // ax-agent's env prefix
         if (env != null) return env;
         return a.get(key);
     }

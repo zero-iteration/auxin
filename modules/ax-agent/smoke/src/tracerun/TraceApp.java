@@ -88,23 +88,71 @@ public final class TraceApp {
             eq("master switch off: 3 requests WITH the header produced 0 documents",
                     0L, documentsBuilt());
             eq("master switch off: nothing was POSTed to /v1/trace", 0, TRACE_POSTS.get());
+            eq("master switch off: Tier-1b is NOT disabled by the trace tier",
+                    false, tier1bDisabledByTrace());
+            eq("master switch off: Tier-1b declined no class for a trace reason",
+                    0L, tier1bTraceBlockedClasses());
         } else if ("conflict-refuse".equals(scenario)) {
-            eq("Tier-1b conflict, policy=refuse: the tracer did NOT arm", false, armed());
-            eq("Tier-1b conflict, policy=refuse: nothing was instrumented",
+            eq("Tier-1b overlap, policy=refuse: the trace tier did NOT arm", false, armed());
+            eq("Tier-1b overlap, policy=refuse: nothing was instrumented for tracing",
                     0, framesRegistered());
             filter.doFilter(new FakeRequest("GET", "/search/101", "1"), resp, null);
             drain();
-            eq("Tier-1b conflict, policy=refuse: 0 documents", 0L, documentsBuilt());
-            eq("Tier-1b conflict, policy=refuse: ax.strip.enabled was NOT touched",
+            eq("Tier-1b overlap, policy=refuse: 0 documents", 0L, documentsBuilt());
+            eq("Tier-1b overlap, policy=refuse: ax.strip.enabled was NOT touched",
                     null, System.getProperty("ax.strip.enabled"));
+            eq("Tier-1b overlap, policy=refuse: Tier-1b was NOT disabled",
+                    false, tier1bDisabledByTrace());
         } else if ("conflict-disablestrip".equals(scenario)) {
-            eq("Tier-1b conflict, policy=disable-strip: the tracer armed", true, armed());
-            eq("Tier-1b conflict, policy=disable-strip: ax.strip.enabled was set to false",
-                    "false", System.getProperty("ax.strip.enabled"));
+            eq("Tier-1b overlap, policy=disable-strip (the default): the trace tier armed",
+                    true, armed());
+            // THE MERGE CHANGED THIS, AND THE NEW ASSERTION IS THE STRONGER ONE.
+            // The old mechanism set ax.strip.enabled=false -- a JVM-WIDE switch -- from one
+            // premain and hoped the other premain had not read it yet. One premain means the
+            // decision is taken in-process and SCOPED: Tier-1b skips the intersection of the two
+            // scopes and strips everything else. So the system property must still be untouched,
+            // and the suppression must be visible as its own reported fact.
+            eq("Tier-1b overlap, policy=disable-strip: ax.strip.enabled is NOT touched -- the "
+                    + "suppression is scoped, not a JVM-wide switch",
+                    null, System.getProperty("ax.strip.enabled"));
+            eq("Tier-1b overlap, policy=disable-strip: tier1bDisabledByTrace is reported",
+                    true, tier1bDisabledByTrace());
             filter.doFilter(new FakeRequest("GET", "/search/101", "1"), resp, null);
             drain();
-            eq("Tier-1b conflict, policy=disable-strip: the traced request produced 1 document",
+            eq("Tier-1b overlap, policy=disable-strip: the traced request produced 1 document",
                     1L, documentsBuilt());
+        } else if ("stripscope".equals(scenario)) {
+            // THE ASSERTION THAT MAKES "SCOPED" A PROPERTY AND NOT A CLAIM.
+            //
+            // Both classes are inside ax.include.packages, so both carry tier-1 probes and both
+            // are Tier-1b candidates. Only traceapp.* is inside ax.trace.include.packages.
+            // Tier-1b must therefore refuse ONE of them and strip the OTHER, and the refusal
+            // must be reported rather than inferred.
+            eq("scoped strip: the trace tier armed", true, armed());
+            eq("scoped strip: Tier-1b is reported as disabled by the trace tier",
+                    true, tier1bDisabledByTrace());
+
+            stripcheck.Plain plain = new stripcheck.Plain();
+            plain.work(7);
+            plain.describe(2);
+            filter.doFilter(new FakeRequest("GET", "/search/101", "1"), resp, null);
+            drain();
+
+            eq("scoped strip: a class OUTSIDE the traced scope still de-instruments",
+                    true, stripNow("stripcheck.Plain"));
+            eq("scoped strip: a class INSIDE the traced scope does NOT de-instrument",
+                    false, stripNow("traceapp.SearchService"));
+            eq("scoped strip: the out-of-scope class is reported as stripped",
+                    true, stripped("stripcheck.Plain"));
+            eq("scoped strip: the traced class is NOT reported as stripped",
+                    false, stripped("traceapp.SearchService"));
+            gtL("scoped strip: the refusal is counted, not silent", 0L,
+                    tier1bTraceBlockedClasses());
+            // And it has to reach the WIRE, or the server and the UI cannot render WHY
+            // steady-state overhead is not zero on this JVM. flushNow() builds AND sends one
+            // window synchronously, so this needs no sleep and no timing assumption.
+            flushNow();
+            gt("scoped strip: one agentHealth window reached /v1/ingest", 0, INGEST_POSTS.get());
         } else if ("prodnotoken".equals(scenario)) {
             eq("production + no token: the tracer did NOT arm", false, armed());
             eq("production + no token: nothing was instrumented", 0, framesRegistered());
@@ -239,17 +287,23 @@ public final class TraceApp {
         @Override public void setStatus(int s) { this.status = s; }
     }
 
-    // ---------------- TraceAgent hooks, reflectively ----------------
+    // ---------------- agent hooks, reflectively ----------------
+    //
+    // SCOPE-v3.1: these used to live on io.auxin.trace.TraceAgent, which was a second
+    // -javaagent's premain class. There is one agent now, so they live on AuxinAgent under
+    // `trace`-prefixed names -- `active()` and `armed()` already mean something there.
     //
     // Reflection, not a direct call, for one reason: the "inert" scenario runs with
-    // ax.trace.enabled=false, and the "conflict-refuse" scenario runs with the tracer refusing
+    // ax.trace.enabled=false, and the "conflict-refuse" scenario runs with the tier refusing
     // to arm. In both the agent jar IS on the classpath, so a direct call would work -- but
     // reflection also lets this harness run with NO agent at all, which is how the baseline for
     // "byte-for-byte what it would be without this agent" is taken.
 
+    private static final String AGENT = "io.auxin.agent.AuxinAgent";
+
     private static Object call(String name) {
         try {
-            Class<?> c = Class.forName("io.auxin.trace.TraceAgent");
+            Class<?> c = Class.forName(AGENT);
             Method m = c.getMethod(name);
             return m.invoke(null);
         } catch (ClassNotFoundException e) {
@@ -260,20 +314,71 @@ public final class TraceApp {
         }
     }
 
-    private static boolean active() { Object o = call("active"); return Boolean.TRUE.equals(o); }
+    private static boolean active() {
+        Object o = call("traceActive");
+        return Boolean.TRUE.equals(o);
+    }
 
-    private static boolean armed() { Object o = call("armed"); return Boolean.TRUE.equals(o); }
+    private static boolean armed() { Object o = call("traceArmed"); return Boolean.TRUE.equals(o); }
 
-    private static int framesRegistered() { return intOf(call("framesRegistered")); }
+    private static int framesRegistered() { return intOf(call("traceFramesRegistered")); }
 
-    private static int armsRegistered() { return intOf(call("armsRegistered")); }
+    private static int armsRegistered() { return intOf(call("traceArmsRegistered")); }
 
-    private static int observationsRegistered() { return intOf(call("observationsRegistered")); }
+    private static int observationsRegistered() {
+        return intOf(call("traceObservationsRegistered"));
+    }
 
-    private static int activeTraces() { return intOf(call("activeTraces")); }
+    private static int activeTraces() { return intOf(call("traceActiveTraces")); }
+
+    /** SCOPE-v3.1: is Tier-1b's auto-strip suppressed for the traced scope on this JVM? */
+    private static boolean tier1bDisabledByTrace() {
+        return Boolean.TRUE.equals(call("tier1bDisabledByTrace"));
+    }
+
+    /** SCOPE-v3.1: has Tier-1b actually declined a class for that reason yet? */
+    private static long tier1bTraceBlockedClasses() {
+        Object o = call("tier1bTraceBlockedClasses");
+        return o instanceof Number ? ((Number) o).longValue() : 0L;
+    }
+
+    /** Forces one coverage window out of band: builds it, serialises it and POSTs it. */
+    private static void flushNow() {
+        try {
+            Class<?> c = Class.forName(AGENT);
+            c.getMethod("flushNow").invoke(null);
+        } catch (Throwable t) {
+            System.out.println("  (flushNow failed: " + t + ")");
+        }
+    }
+
+    /** Tier-1b on demand, by dotted class name. Returns false when the class is not loadable. */
+    private static boolean stripNow(String dotted) {
+        try {
+            Class<?> c = Class.forName(AGENT);
+            Class<?> subject = Class.forName(dotted);
+            Object r = c.getMethod("stripNow", Class.class).invoke(null, subject);
+            return Boolean.TRUE.equals(r);
+        } catch (Throwable t) {
+            System.out.println("  (stripNow(" + dotted + ") failed: " + t + ")");
+            return false;
+        }
+    }
+
+    /** Does Tier-1b believe this class is de-instrumented right now? */
+    private static boolean stripped(String dotted) {
+        try {
+            Class<?> c = Class.forName(AGENT);
+            Object r = c.getMethod("stripped", String.class).invoke(null, dotted);
+            return Boolean.TRUE.equals(r);
+        } catch (Throwable t) {
+            System.out.println("  (stripped(" + dotted + ") failed: " + t + ")");
+            return false;
+        }
+    }
 
     private static long documentsBuilt() {
-        Object o = call("documentsBuilt");
+        Object o = call("traceDocumentsBuilt");
         return o instanceof Number ? ((Number) o).longValue() : 0L;
     }
 
@@ -281,8 +386,8 @@ public final class TraceApp {
 
     private static void forceFailOpen(String why) {
         try {
-            Class<?> c = Class.forName("io.auxin.trace.TraceAgent");
-            c.getMethod("forceFailOpen", String.class).invoke(null, why);
+            Class<?> c = Class.forName(AGENT);
+            c.getMethod("traceForceFailOpen", String.class).invoke(null, why);
         } catch (Throwable t) {
             System.out.println("  (forceFailOpen failed: " + t + ")");
         }
@@ -290,8 +395,8 @@ public final class TraceApp {
 
     private static void drain() {
         try {
-            Class<?> c = Class.forName("io.auxin.trace.TraceAgent");
-            c.getMethod("drain", long.class).invoke(null, Long.valueOf(4000L));
+            Class<?> c = Class.forName(AGENT);
+            c.getMethod("traceDrain", long.class).invoke(null, Long.valueOf(4000L));
         } catch (ClassNotFoundException e) {
             return;
         } catch (Throwable t) {
@@ -331,6 +436,16 @@ public final class TraceApp {
     }
 
     private static void gt(String what, int floor, int actual) {
+        checks++;
+        if (actual > floor) {
+            System.out.println("  PASS  " + what + " (" + actual + " > " + floor + ")");
+        } else {
+            System.out.println("  FAIL  " + what + " (expected > " + floor + ", got " + actual + ")");
+            fails++;
+        }
+    }
+
+    private static void gtL(String what, long floor, long actual) {
         checks++;
         if (actual > floor) {
             System.out.println("  PASS  " + what + " (" + actual + " > " + floor + ")");

@@ -55,3 +55,56 @@ Research completed after the decision, and it supports it. In OTel 2.31.1:
 
 => Embedding OTel would have put our ordering guarantee — the one property E1 measured and the whole
 Tier-1/Tier-1b design rests on — on top of an unsanctioned entry point. **Right call to cancel.**
+
+
+---
+
+# SCOPE v3.1 — one agent, tracing included (owner's decision, 2026-09-13)
+
+> *"we can have one agent only, its fine if it adds overhead for some requests"*
+
+The per-request tracer was built as a **separate** jar because it breaks an invariant: a trace probe
+can never be stripped, so Tier-1b's "steady state -> zero" is false for any class in the traced
+scope. That separation was the cautious answer. The owner has now taken the trade explicitly, so
+the tracer folds into `ax-agent` and there is **one `-javaagent` jar, full stop.**
+
+## Shipped (2026-09-13)
+`modules/ax-trace/` is deleted. One jar, one `Premain-Class` (`io.auxin.agent.AuxinAgent`), one
+ASM relocation (`io.auxin.shaded.asm`), one transformer pair. `TRADE-OFFS.md` and
+`TRACE-CONTRACT.md` moved to `modules/ax-agent/docs/`. The 53-assertion trace suite moved to
+`modules/ax-agent/smoke/run-trace-smoke.sh` and the script **asserts** the migrated count is still
+53 so a lost assertion is a failure rather than a smaller number nobody reads. Its JMH bench is
+gate **G7** in `bench/run-gates.sh`.
+
+## What changes, and what does not
+- **Tracing is off by default.** `ax.trace.enabled=true` opts in. A JVM that never enables it pays
+  nothing: the merged jar's untraced cost is the same code path as before.
+- **When tracing is on, Tier-1b auto-strip is disabled for the intersection of the traced and
+  instrumented scopes** -- automatically, and **loudly**: a premain WARN, a line in the startup
+  summary, and `tier1bDisabledByTrace` on the wire so the server and UI can render *why* steady-state
+  overhead is not zero on this JVM.
+- **Classes outside the traced scope still strip normally.** That is the entire point of scoping:
+  you pay where you asked to and nowhere else. It is asserted, not assumed.
+- `ax.trace.strip.conflict=disable-strip|refuse|allow` keeps the old refusing behaviour reachable.
+
+## Why "loudly" is the load-bearing word
+The danger was never the overhead -- it was that **Tier-1b would still *succeed*** on a traced
+class. Nothing about a trace probe looks like a tier-1 shape, so the strip matches, the counter
+increments, and you get a **true counter and a false conclusion**: a JVM that reports
+`classesStripped` while keeping probes on the hot path forever. That is the exact signature of the
+nine "reports success while doing nothing" bugs this project has already found. Taking the trade is
+fine; taking it silently would not be.
+
+## What this costs, stated plainly
+- Traced classes keep their probes for the life of the JVM -- the zero-steady-state property is
+  **given up**, not deferred, for that scope.
+- While any thread is inside a trace, every other thread's probes fall through the gate into a
+  `ThreadLocal` that finds nothing: **2.6-5.0 ns/site**, allocation-free, bounded by the rate cap.
+- The untraced path remains **allocation-free and sub-nanosecond**. RE-MEASURED from the merged
+  jar (`bench/run-gates.sh g7`, 2026-09-13): **0.17-0.76 ns/probe site at 0.00 B/op** across
+  JDK 11/17/21 and 1/4/10 threads, against 0.17-0.83 ns pre-merge. **Merging did not move it.**
+- One number is NOT re-quoted from the old run: the *contended* arm (a trace open on another
+  thread) measured **7.2 ns/site at 10 threads on JDK 17** against the recorded 3.4. It is
+  reproducible in this session but is not attributed to the merge — the `baseline` arm moved
+  23.1 -> 16.8 ns/op in the same session, so the machine profile differs, and the code on that
+  path is byte-identical. See `modules/ax-agent/docs/TRADE-OFFS.md` §3.

@@ -69,6 +69,12 @@ public final class DrainThread implements Runnable {
     private final Tier2Aggregator aggregator;
     private final HttpSender sender;
     private final ProbeStripper stripper;
+
+    /**
+     * The Tier-1b / trace overlap decision, taken once at premain. Consulted per class by
+     * {@link #strippable}; inert (and free) when the trace tier is off, which is the default.
+     */
+    private final io.auxin.trace.config.StripConflict stripConflict;
     private final Instrumentation instrumentation;
     private final Clock clock;
     private final EnvironmentClassification environment;
@@ -134,7 +140,9 @@ public final class DrainThread implements Runnable {
 
     public DrainThread(Options options, Manifest manifest, Ring ring, Tier2Aggregator aggregator,
                        Ring edgeRing, EdgeAggregator edgeAggregator,
-                       HttpSender sender, ProbeStripper stripper, Instrumentation instrumentation,
+                       HttpSender sender, ProbeStripper stripper,
+                       io.auxin.trace.config.StripConflict stripConflict,
+                       Instrumentation instrumentation,
                        Clock clock, EnvironmentClassification environment) {
         this.options = options;
         this.manifest = manifest;
@@ -144,6 +152,8 @@ public final class DrainThread implements Runnable {
         this.edgeAggregator = edgeAggregator;
         this.sender = sender;
         this.stripper = stripper;
+        this.stripConflict = stripConflict == null
+                ? io.auxin.trace.config.StripConflict.inert() : stripConflict;
         this.instrumentation = instrumentation;
         this.clock = clock;
         this.environment = environment;
@@ -261,6 +271,14 @@ public final class DrainThread implements Runnable {
         w.stripBlocked = Health.stripsBlocked();
         w.stripReArms = Health.stripReArms();
         w.stripMaskMissing = Health.stripMasksMissing();
+
+        // SCOPE-v3.1. The whole reason this is on the wire: classesStripped is a true counter
+        // that would otherwise support a false conclusion. These two fields are what let a
+        // server or a UI render "steady-state overhead is not zero on this JVM, and here is
+        // exactly which scope bought that".
+        w.tier1bDisabledByTrace = Health.tier1bDisabledByTrace();
+        w.tier1bTraceScope = Health.tier1bTraceScope();
+        w.tier1bTraceBlockedClasses = Health.tier1bTraceBlockedClasses();
 
         // "I was configured to do work and did none" must never look like a clean run
         // (G5-BUG-1). classesInstrumented is cumulative for the JVM, so this latches itself off
@@ -573,6 +591,21 @@ public final class DrainThread implements Runnable {
      */
     private boolean strippable(String cls, boolean[] live) {
         try {
+            // SCOPE-v3.1, AND IT COMES FIRST. A class in BOTH the traced and the instrumented
+            // scope can never reach zero steady-state overhead -- its trace probes are not
+            // strippable -- so Tier-1b must not strip it and report a number that reads as
+            // "overhead is now zero". Refused per class, counted per class, and announced once
+            // at premain; a class outside ax.trace.include.packages falls straight through and
+            // strips exactly as it did before this tier existed.
+            //
+            // Ahead of the forcedStrips check on purpose. stripNow() carries the same refusal
+            // (see below): a break-glass hook that reported a successful strip for a traced
+            // class would recreate the exact failure this gate exists to prevent -- a true
+            // counter and a false conclusion -- one manual call at a time.
+            if (stripConflict.blocksStrip(cls)) {
+                Health.tier1bStripBlocked(cls);
+                return false;
+            }
             if (forcedStrips.contains(cls)) return true;
             final boolean[] installed = ProbeHolder.installedProbes(cls);
             if (installed == null || live == null || installed.length != live.length) {
@@ -693,6 +726,21 @@ public final class DrainThread implements Runnable {
      */
     public boolean stripNow(Class<?> c) {
         if (instrumentation == null || c == null) return false;
+        // SCOPE-v3.1: the same refusal the automatic path makes, for the same reason. Removing
+        // the coverage probes from a traced class does not take its overhead to zero -- the
+        // trace probes stay -- so reporting a successful strip would be a lie an operator has
+        // no way to see through. Refused, counted, and said once per class.
+        if (stripConflict.blocksStrip(c.getName())) {
+            Health.tier1bStripBlocked(c.getName());
+            if (Health.warnOnce("tier1bTraceBlocked:" + c.getName())) {
+                Log.warn("stripNow(" + c.getName() + ") REFUSED: the class is in both "
+                        + "ax.include.packages and ax.trace.include.packages, and a trace probe "
+                        + "can never be stripped. De-instrumenting it would remove the coverage "
+                        + "probes and report a strip, while the hot path kept every trace probe. "
+                        + "Counted as agentHealth.tier1bTraceBlockedClasses.");
+            }
+            return false;
+        }
         String internal = c.getName().replace('.', '/');
         stripAttempts.put(c.getName(), Integer.valueOf(attempts(c.getName()) + 1));
         stripper.arm(internal);

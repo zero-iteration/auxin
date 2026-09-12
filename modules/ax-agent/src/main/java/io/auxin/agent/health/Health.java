@@ -117,6 +117,53 @@ public final class Health {
     private static volatile boolean degraded;
     private static volatile String degradedReason = "";
 
+    // ---- Tier-1b / trace overlap (SCOPE-v3.1) ----
+    /**
+     * Tier-1b's auto-strip is suppressed for the intersection of the traced and instrumented
+     * scopes. Set once at premain and never cleared.
+     *
+     * <p>This exists because the failure mode being prevented is a <b>true counter and a false
+     * conclusion</b>: without it, {@code classesStripped} rises for classes whose hot path still
+     * carries trace probes, and an operator reads "overhead is now zero" and is wrong. Taking the
+     * trade is fine; taking it silently is not, so it ships on the wire next to the count of
+     * classes it actually affected.
+     */
+    private static volatile boolean TIER1B_DISABLED_BY_TRACE;
+
+    /** The scope intersection responsible, for the startup line and the wire. */
+    private static volatile String TIER1B_TRACE_SCOPE = "";
+
+    /**
+     * Distinct classes Tier-1b declined to strip because they are traced. Bounded: past the cap
+     * the count keeps rising and the name set stops growing, because this is a diagnostic and
+     * not a reason to hold a million strings.
+     */
+    private static final ConcurrentHashMap<String, Boolean> TIER1B_TRACE_BLOCKED =
+            new ConcurrentHashMap<String, Boolean>();
+    private static final AtomicLong TIER1B_TRACE_BLOCKED_COUNT = new AtomicLong();
+    private static final int TIER1B_TRACE_BLOCKED_CAP = 10000;
+
+    /** Records the premain decision. Called once, whether or not any class ever hits it. */
+    public static void tier1bDisabledByTrace(String scopeDescription) {
+        TIER1B_TRACE_SCOPE = scopeDescription == null ? "" : scopeDescription;
+        TIER1B_DISABLED_BY_TRACE = true;
+    }
+
+    /**
+     * One class Tier-1b was asked about and refused, because it is traced. Idempotent per class:
+     * the drain thread asks again on every cycle and this must not count the same class twice.
+     */
+    public static void tier1bStripBlocked(String dottedClassName) {
+        if (TIER1B_TRACE_BLOCKED.size() >= TIER1B_TRACE_BLOCKED_CAP) return;
+        if (TIER1B_TRACE_BLOCKED.putIfAbsent(dottedClassName, Boolean.TRUE) == null) {
+            TIER1B_TRACE_BLOCKED_COUNT.incrementAndGet();
+        }
+    }
+
+    public static boolean tier1bDisabledByTrace() { return TIER1B_DISABLED_BY_TRACE; }
+    public static String tier1bTraceScope() { return TIER1B_TRACE_SCOPE; }
+    public static long tier1bTraceBlockedClasses() { return TIER1B_TRACE_BLOCKED_COUNT.get(); }
+
     public static void skip(String reason) {
         counter(reason).incrementAndGet();
     }

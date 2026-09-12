@@ -1,5 +1,0 @@
-target/
-bench/target/
-bench/results/
-smoke/out/
-dependency-reduced-pom.xml

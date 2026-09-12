@@ -1,4 +1,4 @@
-package io.auxin.trace.bench;
+package ax.bench.g7;
 
 import io.auxin.trace.runtime.RateCap;
 import io.auxin.trace.runtime.SiteRegistry;
@@ -29,11 +29,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * THE GATE. What a request that is NOT being traced pays.
  *
- * <p>This is the one number that decides whether this module can ship. The claim under test is
- * the one in TRADE-OFFS.md: <b>one static load and one branch per probe site, no allocation.</b>
- * The arms call the real shipped {@code io.auxin.trace.runtime.TraceRuntime} out of
- * {@code ../target/ax-trace.jar}, so HotSpot's inlining decision about the shipped code is what
- * is measured — not a decision about a copy of it in this module.
+ * <p>GATE G7, migrated from {@code modules/ax-trace/bench} when the tracer became a tier inside
+ * ax-agent (SCOPE-v3.1). It is the one number that decides whether that tier can ship, and the
+ * merge is exactly the kind of change that could move it — so it is RE-MEASURED from the merged
+ * jar rather than quoted from the separate-agent run.
+ *
+ * <p>The claim under test is the one in {@code modules/ax-agent/docs/TRADE-OFFS.md}: <b>one
+ * static load and one branch per probe site, no allocation.</b> The arms call the real shipped
+ * {@code io.auxin.trace.runtime.TraceRuntime} out of
+ * {@code ../modules/ax-agent/target/ax-agent.jar}, so HotSpot's inlining decision about the
+ * shipped code is what is measured — not a decision about a copy of it in this module.
  *
  * <h3>The arms</h3>
  * <table>
@@ -94,8 +99,9 @@ public class UntracedPathBenchmark {
         obsB = SiteRegistry.registerObs(frameId, SiteRegistry.OBS_PARAM_ENTRY, 1, "I", "arg1");
         obsRet = SiteRegistry.registerObs(frameId, SiteRegistry.OBS_RETURN, -1, "I", "return");
         // 153 == Opcodes.IFEQ. The literal, not the constant: ASM is SHADED into the agent jar
-        // as io.auxin.trace.shaded.asm, so org.objectweb.asm.Opcodes does not exist on this
-        // classpath -- and the bench must run against the shipped jar, not a reconstruction.
+        // as io.auxin.shaded.asm (ONE relocation since the merge), so org.objectweb.asm.Opcodes
+        // does not exist on this classpath -- and the bench must run against the shipped jar,
+        // not a reconstruction.
         armId = SiteRegistry.registerArm(frameId, 153, 47, "call");
 
         list = new ArrayList<String>();

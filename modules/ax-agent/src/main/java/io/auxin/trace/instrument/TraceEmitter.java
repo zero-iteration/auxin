@@ -64,13 +64,11 @@ import java.util.List;
  * <b>Nothing else emitted here needs a frame at all.</b> No probe adds a local, no probe adds a
  * branch, and the operand duplication ({@code DUP}/{@code DUP2}) is balanced before the next
  * instruction. The only construct that needs the verifier told anything is the
- * {@code catch (Throwable)} handler, and it is written by hand as one entry declaring
- * <b>zero locals</b> and a single {@code java/lang/Throwable} on the stack — the identical
- * argument {@code ProbeEmitter.emitEdgeRoot} makes: the handler reads no local (the id is a
- * bytecode constant and the throwable is on the stack), and an undeclared local is {@code top},
- * which every actual type is assignable to. Declaring the real local layout would mean naming
- * types, and every named type is another chance to name it wrong — which is a VerifyError at
- * class definition, not a missing observation.
+ * {@code catch (Throwable)} handler, and it is written by hand as one entry declaring the
+ * <b>receiver and the descriptor's arguments</b> (then {@code TOP} for every remaining slot) and
+ * a single {@code java/lang/Throwable} on the stack. It declared zero locals once, copying
+ * {@code ProbeEmitter.emitEdgeRoot}, and that produced a {@code VerifyError} the moment another
+ * handler range covered this block — see the comment at the frame itself.
  *
  * <h3>The four frame cases ax-agent had to learn, and what this module does about each</h3>
  * <ol>
@@ -78,10 +76,12 @@ import java.util.List;
  *       here: this emitter never puts a frame at offset 0, only instructions, so there is never
  *       a second entry at that offset. ({@code ProbeEmitter.entryFrameLabel} exists because
  *       tier-1's read-then-store probe DOES need a merge point there.)</li>
- *   <li><b>Expanded frames.</b> This module always reads with flags {@code 0}, so ASM hands back
- *       compressed frames and the handler entry is written {@code F_FULL}. ASM cannot mix
- *       {@code F_NEW} with compressed frames in one method and this way the question never
- *       arises. (ax-agent needs EXPAND_FRAMES for tier-2, which adds a local; we add none.)</li>
+ *   <li><b>Expanded frames.</b> ASM cannot mix {@code F_NEW} with compressed frames in one
+ *       method, and since SCOPE-v3.1 this tier shares {@code ProbeInstaller}'s single read of
+ *       the class — which uses EXPAND_FRAMES whenever the class carries a tier-2 method. So the
+ *       handler entry is written {@code F_NEW} when the method already carries an expanded frame
+ *       and {@code F_FULL} otherwise, read off the method rather than assumed. This tier still
+ *       adds no local, so no pre-existing frame ever has to learn anything.</li>
  *   <li><b>{@code <init>}.</b> A {@code catch (Throwable)} handler inside a constructor has to
  *       merge against a state where {@code this} may be {@code uninitializedThis}, and a frame
  *       with zero locals asserts {@code flagThisUninit = false}. That is a VerifyError, so
@@ -389,10 +389,17 @@ public final class TraceEmitter {
             post.add(handler);
             if (frameNeeded) {
                 // The receiver and the declared arguments, then TOP for every remaining slot,
-                // and one java/lang/Throwable on the stack. F_FULL, never F_NEW: this module
-                // always reads with flags 0, so every frame in the method is compressed and ASM
-                // refuses to mix the two forms. ax-agent hit exactly this with
-                // ax.tier2.enabled=false and an unconditional F_NEW silently refused every root.
+                // and one java/lang/Throwable on the stack.
+                //
+                // >>> F_NEW OR F_FULL, decided per method (SCOPE-v3.1). Both encode the identical
+                // full_frame on the wire, but ASM cannot MIX the two within one method. While
+                // this was a separate agent the answer was always F_FULL, because it always read
+                // with flags 0. In the merged transformer ProbeInstaller reads with
+                // EXPAND_FRAMES whenever the class carries a tier-2 method, and tier-2 has
+                // already added an F_NEW handler frame of its own by the time we get here -- so
+                // the form has to be read off the method rather than assumed. ax-agent hit the
+                // mirror image of this with ax.tier2.enabled=false, where an unconditional F_NEW
+                // silently refused every edge root.
                 //
                 // >>> WHY NOT ZERO LOCALS. It was zero locals first, copying
                 // ProbeEmitter.emitEdgeRoot's argument -- the handler reads no local, and an
@@ -416,8 +423,8 @@ public final class TraceEmitter {
                 // descriptor, and <init> (the one place local 0 is uninitializedThis) never
                 // reaches here.
                 Object[] locals = handlerFrameLocals(cn, m);
-                post.add(new FrameNode(Opcodes.F_FULL, locals.length, locals, 1,
-                        new Object[]{"java/lang/Throwable"}));
+                post.add(new FrameNode(hasExpandedFrame(m) ? Opcodes.F_NEW : Opcodes.F_FULL,
+                        locals.length, locals, 1, new Object[]{"java/lang/Throwable"}));
             }
             post.add(new InsnNode(Opcodes.DUP));
             push(post, frameId);
@@ -774,6 +781,19 @@ public final class TraceEmitter {
      * agent that pads frames to its own slot (ax-agent's {@code extendFrameLocals}) finds exactly
      * the slot count it expects.
      */
+    /**
+     * Does this method already carry an EXPANDED frame? Byte-identical in intent to
+     * {@code ProbeEmitter.hasExpandedFrame}; kept here so the trace tier reads the method's own
+     * state rather than trusting a flag threaded down from the installer.
+     */
+    private static boolean hasExpandedFrame(MethodNode m) {
+        for (AbstractInsnNode insn = m.instructions.getFirst(); insn != null;
+                insn = insn.getNext()) {
+            if (insn instanceof FrameNode && ((FrameNode) insn).type == Opcodes.F_NEW) return true;
+        }
+        return false;
+    }
+
     private static Object[] handlerFrameLocals(ClassNode cn, MethodNode m) {
         List<Object> locals = new ArrayList<Object>();
         int slot = 0;

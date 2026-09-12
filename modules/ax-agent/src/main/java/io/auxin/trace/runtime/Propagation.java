@@ -203,7 +203,7 @@ public final class Propagation {
         }
 
         /** So a debugger, a thread dump and {@code Thread.getName} still say something useful. */
-        @Override public String toString() { return "ax-trace:" + d.getClass().getName(); }
+        @Override public String toString() { return "auxin/trace:" + d.getClass().getName(); }
     }
 
     static final class CarrierCallable<T> implements Callable<T> {

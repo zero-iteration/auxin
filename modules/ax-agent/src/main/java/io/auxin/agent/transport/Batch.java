@@ -77,6 +77,14 @@ public final class Batch {
         sb.append(w.stripReArms);
         h = Json.key(sb, h, "stripMaskMissing");
         sb.append(w.stripMaskMissing);
+        // SCOPE-v3.1. Next to classesStripped on purpose: the two must be read together or the
+        // first one means something it does not mean.
+        h = Json.key(sb, h, "tier1bDisabledByTrace");
+        sb.append(w.tier1bDisabledByTrace);
+        h = Json.key(sb, h, "tier1bTraceBlockedClasses");
+        sb.append(w.tier1bTraceBlockedClasses);
+        h = Json.key(sb, h, "tier1bTraceScope");
+        Json.writeString(sb, w.tier1bTraceScope == null ? "" : w.tier1bTraceScope);
         h = Json.key(sb, h, "scopeMatchedNothing");
         sb.append(w.scopeMatchedNothing);
         h = Json.key(sb, h, "classesLoadedTruncated");

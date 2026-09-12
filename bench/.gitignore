@@ -1,3 +1,4 @@
 target/
 results/g4-classes/
+results-merged/
 dependency-reduced-pom.xml

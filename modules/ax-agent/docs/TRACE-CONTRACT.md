@@ -1,10 +1,12 @@
-# ax-trace wire contract — the trace document
+# Trace wire contract — the trace document
 
-**Contract version 1.** This file is the contract for `ax-trace` and nothing else.
-`docs/CONTRACTS.md` is the contract for the aggregate path (`ax-static` → `ax-agent` →
-`gt-collector`) and is **not edited by this module**. The two are deliberately separate
-documents, on separate endpoints, with separate schema versions, because they have separate
-failure modes — see §2.
+**Contract version 1.** This file is the contract for the **per-request trace tier** and nothing
+else. `docs/CONTRACTS.md` is the contract for the aggregate path (`ax-static` → `ax-agent` →
+`gt-collector`) and is **not edited by this tier**. The two are deliberately separate documents,
+on separate endpoints, with separate schema versions, because they have separate failure modes —
+see §2. **That stays true after SCOPE-v3.1 folded the tracer into `ax-agent.jar`:** one jar, one
+premain, one transformer pair — and still two wire contracts, because merging the *delivery* of
+two payloads is not a reason to merge the payloads.
 
 ---
 
@@ -75,8 +77,10 @@ X-Auxin-Trace-Token: <ax.trace.token>      (only when a token is configured)
 Sharing a route means a trace document a stricter collector rejects opens the **same circuit
 breaker** that carries coverage — i.e. tracing a request could take the aggregate path down.
 `TraceSender` therefore has its own `HttpURLConnection`, its own failure counter, its own
-cooldown, and shares no state whatsoever with `ax-agent`'s `HttpSender`. The smoke suite asserts
-this directly: it serves both routes and asserts `/v1/ingest` receives **zero** POSTs.
+cooldown, and shares no state whatsoever with `HttpSender`. **One jar did not change this** —
+they are still two senders, two circuit breakers and two routes. The smoke suite asserts it
+directly: it serves both routes and asserts `/v1/ingest` receives **zero** POSTs during a traced
+request.
 
 A `2xx` is success. Anything else counts a failure; three consecutive failures open the circuit
 for 60 s. A dead trace collector must cost the application nothing.
@@ -226,9 +230,13 @@ is always distinguishable from "nobody asked it to". The contract is the PLAN-v2
 
 - `runtimeFailures >= 1` — the tracer hit something unexpected and latched itself off for the
   life of the JVM. The application is unaffected; the tracer is dead until restart.
-- `stripConflictUnresolved >= 1` — `ax.trace.strip.conflict=disable-strip` did not take, because
-  ax-agent read `ax.strip.enabled` before this agent set it. Tier-1b is reporting successful
-  strips for classes whose steady-state overhead is **not** zero. See TRADE-OFFS.md §2.
+- `stripConflictUnresolved >= 1` — **structurally impossible since SCOPE-v3.1 and therefore
+  always 0.** It meant "`disable-strip` did not take, because ax-agent read `ax.strip.enabled`
+  before this agent set it" — an ordering hazard between two premains. There is one premain now,
+  so the field is retained for wire compatibility and carries no signal. The fact it used to
+  approximate now ships on the **aggregate** wire, where Tier-1b actually lives, as
+  `agentHealth.tier1bDisabledByTrace` / `tier1bTraceBlockedClasses` / `tier1bTraceScope`. See
+  TRADE-OFFS.md §2.
 
 `skipped` reasons emitted by this module: `trivialAccessor`, `throwCaptureUnsupportedInit`,
 `throwCaptureUnsupportedV50`, `entryNeedsThrowHandler`, `agentNotVisible`, `generatedClass`,
@@ -312,7 +320,7 @@ Onboarding a service is this file. It is not a code change, which was the requir
 | `ax.trace.max.arms.per.frame` | `64` | |
 | `ax.trace.record.path` | `true` | |
 | `ax.trace.record.timings` | `true` | |
-| `ax.trace.strip.conflict` | `refuse` | `refuse` / `disable-strip` / `allow` — TRADE-OFFS.md §2 |
+| `ax.trace.strip.conflict` | **`disable-strip`** | `refuse` / `disable-strip` / `allow` — TRADE-OFFS.md §2. The default changed at SCOPE-v3.1: the trade is taken (scoped, and loudly) rather than refused. |
 | `ax.trace.projection` | *(unset)* | |
 | `ax.trace.redact.allow` | *(unset)* | normalised names exempted from the denylist |
 | `ax.trace.collector.url` | *(unset)* | a bare authority gets `/v1/trace` appended, announced |
@@ -320,7 +328,17 @@ Onboarding a service is this file. It is not a code change, which was the requir
 | `ax.trace.dump.dir` | *(unset)* | write every instrumented class and document to disk |
 | `ax.trace.log.level` | `info` | |
 
-Resolution order, later wins: built-in default → `-javaagent:ax-trace.jar=k=v,k=v` → system
-property `ax.trace.*` → environment variable `AX_TRACE_*`.
+Resolution order, later wins: built-in default → `-javaagent:ax-agent.jar=trace.k=v,trace.k=v` →
+system property `ax.trace.*` → environment variable `AX_TRACE_*` (or `GT_TRACE_*`).
 
-`ax.environment` (shared with ax-agent) classifies the JVM. It is **read**, never written.
+Since SCOPE-v3.1 these keys are parsed by `io.auxin.agent.config.Options` out of the **same**
+agent-argument map as every other `ax.` key, under a `trace.` prefix — which is why there is no
+second `-javaagent` argument string. `ax.enabled=false` is upstream of `ax.trace.enabled` and
+disables the tier with everything else; `ax.log.level` sets the tier's log level unless
+`ax.trace.log.level` overrides it. The old
+`-javaagent:ax-trace.jar=k=v` form is gone with the jar.
+
+`ax.environment` (shared with the coverage tiers) classifies the JVM. It is **read**, never
+written. There is no longer a `TraceAgent` premain class: the ops hooks live on
+`io.auxin.agent.AuxinAgent` under `trace`-prefixed names (`traceActive`, `traceArmed`,
+`traceDrain`, `traceForceFailOpen`, `tier1bDisabledByTrace`, …).

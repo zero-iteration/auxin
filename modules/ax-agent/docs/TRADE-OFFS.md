@@ -1,17 +1,35 @@
-# ax-trace — what this module gives up, what that buys, and what it costs
+# The trace tier — what it gives up, what that buys, and what it costs
 
 Read this before turning `ax.trace.enabled=true` on anything you care about.
+
+> **SCOPE-v3.1 (2026-09-13), owner's decision.** This was `modules/ax-trace`, a **second**
+> `-javaagent`. It is now a **tier inside `ax-agent`, shipped in the one `ax-agent.jar`, off by
+> default.** The owner took the trade explicitly: *"we can have one agent only, its fine if it
+> adds overhead for some requests."* The ledger below is unchanged — the module boundary was
+> never what made the invariants hold — but §2 is: the mutual exclusion that used to **refuse**
+> now **disables Tier-1b's auto-strip for the intersection of the two scopes**, automatically,
+> loudly, and only there. Sections marked *(pre-merge)* describe the separated design and are
+> kept because the reasoning still explains why each piece is shaped the way it is.
 
 auxin's stated invariants (`docs/SCOPE-v3.md`, "Invariants that do NOT change") are:
 
 > Zero allocation on the app hot path. Tier-1b strips to literally zero steady-state overhead.
 > Fail-open absolutely. Default-deny scope. **No values recorded — ever.**
 
-**This module breaks two of those outright and one structurally.** That is not an oversight and
-it is not a tuning parameter; it is the design. So it lives in its own module, behind its own
-master switch, shipped as its own `-javaagent`, writing to its own endpoint, with its own
-contract file — and it must **never** be folded into tier-1, tier-1b, tier-2 or the call-edge
-tier.
+**This tier breaks two of those outright and one structurally.** That is not an oversight and
+it is not a tuning parameter; it is the design. It therefore keeps its own master switch (default
+**off**), its own endpoint, its own document and its own contract file — and it is still never
+folded into tier-1, tier-1b, tier-2 or the call-edge tier as a *behaviour*. What it no longer
+keeps is its own jar and its own premain.
+
+**Why the separation was dropped, honestly.** The separate jar bought one real thing: a trace
+probe could not reach tier-1's cost profile by accident. It cost two real things: a second
+`-javaagent` to deploy and reason about, and a Tier-1b resolution that depended on
+*`-javaagent` ordering* — one premain setting a system property and hoping the other had not read
+it yet, verified reflectively three seconds after startup and escalated to
+`stripConflictUnresolved` when it had not. One premain deletes that whole class of bug. The
+protection the separation gave is now a scope check, which is stronger: it is evaluated per class,
+on the same `Scope` objects the transformer uses.
 
 ---
 
@@ -24,7 +42,7 @@ tier.
 | **Strippable (Tier-1b → zero steady state)** | **STRUCTURALLY IMPOSSIBLE** | §2. This is the one that cannot be bought back at any price. |
 | **Zero allocation on the app hot path** | **HELD** — measured 0 B/op on every untraced arm at 1, 4 and 10 threads (§3). A *traced* request allocates, obviously. |
 | **Fail-open absolutely** | **HELD** — one latch, one counter, one WARN; exercised by the smoke suite's RUN J. |
-| **Default-deny scope** | **HELD, and harder than ax-agent's** — there is no instrument-everything switch in this module and there is not going to be one, because a wide scope here is a data-exposure surface and not merely a cost. |
+| **Default-deny scope** | **HELD, and harder than the coverage scope's** — there is no instrument-everything switch in this tier and there is not going to be one, because a wide scope here is a data-exposure surface and not merely a cost. |
 
 ---
 
@@ -39,7 +57,9 @@ it is needed on the one future request nobody has made yet, and you cannot know 
 request that will be. So for any class in the traced scope, **"steady state reaches zero" is not
 slower — it is false.**
 
-The agent jar says so: `Can-Retransform-Classes: false`. There is nothing here to strip.
+*(pre-merge: the `ax-trace.jar` manifest said `Can-Retransform-Classes: false`, because there
+was nothing in it to retransform. The merged jar says `true`, because Tier-1b lives in it — which
+is precisely why the per-class refusal above has to exist rather than a manifest flag.)*
 
 ### The failure mode this creates, and why it is the dangerous kind
 
@@ -49,38 +69,88 @@ reports a clean strip — for a class whose hot path still carries every trace p
 counter and a false conclusion.** An operator reads "overhead is now zero" and is wrong by
 however much the trace probes cost.
 
-### Therefore: detection is mandatory, at startup, and it is loud
+### Therefore: the trade is TAKEN, at startup, per scope, and it is loud
 
-`StripConflict.detect()` runs in `premain`, computes the **intersection** of
-`ax.trace.include.packages` and `ax.include.packages` (no overlap, no conflict — tracing
-`com.acme.search` while ax-agent covers `com.acme.billing` leaves billing's claim intact), and:
+`StripConflict.detect()` runs in `premain` from the one `Options` object, computes the
+**intersection** of `ax.trace.include.packages` and `ax.include.packages` (no overlap, no
+conflict — tracing `com.acme.search` while coverage covers `com.acme.billing` leaves billing's
+claim intact), and:
 
 | `ax.trace.strip.conflict` | behaviour |
 |---|---|
-| **`refuse`** (default) | **The tracer does not arm.** Nothing is instrumented. ax-agent keeps every property it promised. The message names both settings, explains *why* it is a contradiction, and lists the four ways out. |
-| `disable-strip` | The tracer arms and Tier-1b is turned off (`ax.strip.enabled=false`), said in the startup line. Requires `-javaagent:ax-trace.jar` **before** `-javaagent:ax-agent.jar`, which is stated, and then **verified** against the live `AuxinAgent.options().stripEnabled` three seconds after startup — a failed verification is a WARN plus `health.stripConflictUnresolved`. |
-| `allow` | Both arm. The operator has said explicitly that they accept it, and it is reported in every document's health block. |
+| **`disable-strip`** (DEFAULT since SCOPE-v3.1) | The trace tier arms. **Tier-1b's auto-strip is disabled for the intersection and for nothing else** — a class covered by `ax.include.packages` but outside the traced scope strips exactly as it always did. One WARN at premain naming the scope, a field in the startup summary, and `tier1bDisabledByTrace` + `tier1bTraceBlockedClasses` + `tier1bTraceScope` on the wire. |
+| `refuse` (the pre-merge default, still reachable) | **The trace tier does not arm.** Nothing is instrumented for tracing. Tier-1b keeps every property it promised. The message names both settings, explains *why* it is a contradiction, and lists the ways out. |
+| `allow` | Both arm; Tier-1b strips traced classes too. The operator has said explicitly that they accept a `classesStripped` count that does not mean zero overhead, and it is reported. |
 
-The default refuses **the new thing**, not the old one. Someone who set `ax.trace.enabled=true`
-in a hurry did not intend to change ax-agent's cost profile.
+**How the refusal is enforced.** `DrainThread.strippable()` asks
+`StripConflict.blocksStrip(class)` before anything else, and so does the `stripNow()` break-glass
+hook — a manual strip must not be the way this invariant gets bypassed one call at a time. Each
+refusal increments `tier1bTraceBlockedClasses` (distinct classes, capped at 10 000 names) and says
+so once per class.
+
+**What the merge deleted, and it is worth naming.** The old `disable-strip` set
+`ax.strip.enabled=false`, a **JVM-wide** switch, from one premain, hoping the other premain had
+not read it yet; it then verified that reflectively after three seconds and escalated to
+`health.stripConflictUnresolved`. That ordering assumption no longer exists — there is one
+premain and one `Options` — so `stripConflictUnresolved` is now **structurally always 0**. It
+stays on the wire for compatibility. And the suppression got *narrower*: JVM-wide became
+scope-wide.
 
 The trade is also printed in the startup line on every armed JVM, so nobody has to read this
 file to learn that a property they were promised no longer holds:
 
 ```
-[ax-trace] INFO  TRADE-OFF, stated at startup: trace probes are NOT strippable, so for
-traceapp the "steady state reaches zero overhead" property of ax-agent Tier-1b does not apply
-while this agent is armed. Untraced requests still pay only one static load and one branch per
-probe site (measured; see modules/ax-trace/TRADE-OFFS.md). Master switch: ax.trace.enabled=false.
+[auxin/trace] INFO  TRADE-OFF, stated at startup: trace probes are NOT strippable, so for
+traceapp the "steady state reaches zero overhead" property of Tier-1b does not apply while this
+tier is armed. Tier-1b auto-strip is therefore DISABLED for that intersection and for nothing
+else; classes covered by ax.include.packages but outside the traced scope still strip to zero.
+Untraced requests still pay only one static load and one branch per probe site (measured; see
+modules/ax-agent/docs/TRADE-OFFS.md). Master switch: ax.trace.enabled=false.
 ```
 
 ---
 
 ## 3. The measured cost
 
-`bench/run-bench.sh`. JMH 1.37, `AverageTime`, 2 forks × (5 × 1 s warmup + 8 × 1 s measurement),
-`-prof gc`. The arms call the **shipped** `io.auxin.trace.runtime.TraceRuntime` out of
-`target/ax-trace.jar`, so HotSpot's inlining decision about the shipped code is what is reported.
+`bench/run-gates.sh g7` (**GATE G7**, migrated from `modules/ax-trace/bench/run-bench.sh`). JMH
+1.37, `AverageTime`, 2 forks × (5 × 1 s warmup + 8 × 1 s measurement), `-prof gc`. The arms call
+the **shipped** `io.auxin.trace.runtime.TraceRuntime` out of
+`modules/ax-agent/target/ax-agent.jar`, so HotSpot's inlining decision about the shipped code is
+what is reported.
+
+> ### RE-MEASURED FROM THE MERGED JAR (2026-09-13)
+>
+> The pre-merge numbers are kept below, greyed by this note rather than deleted, because the
+> comparison is the point. **The untraced claim survived the merge**; one number did not, and it
+> is named rather than quoted from the old run.
+>
+> | arm | sites | t=1 | t=4 | t=10 | B/op |
+> |---|---|---|---|---|---|
+> | `baseline` | 0 | 7.972 ± 0.243 | 9.991 ± 0.427 | 16.780 ± 0.264 | **0.00** |
+> | `enterExit` | 2 | 8.386 ± 0.024 | 11.500 ± 0.157 | 18.370 ± 0.318 | **0.00** |
+> | `fullProbeSet` | 6 | 9.051 ± 0.065 | 12.184 ± 0.271 | 19.885 ± 0.434 | **0.00** |
+> | `obsRefOnly` (standalone) | 1 | 0.592 ± 0.012 | 0.719 ± 0.005 | 1.074 ± 0.010 | **0.00** |
+> | `wrapUntraced` (standalone) | 1 | 0.560 ± 0.003 | 0.660 ± 0.004 | 0.898 ± 0.024 | **0.00** |
+> | `fullProbeSetWhileAnotherThreadTraces` | 6 | 23.389 ± 0.709 | 32.587 ± 0.285 | 60.260 ± 0.878 | **0.00** |
+>
+> **Per probe site, untraced, JDK 17:** `enterExit` **0.207 / 0.755 / 0.483 ns** and
+> `fullProbeSet` **0.180 / 0.366 / 0.428 ns** at 1 / 4 / 10 threads. JDK 11 t=1: **0.173 /
+> 0.244 ns**. JDK 21 t=1: **0.180 / 0.211 ns**. **0.00 B/op on every untraced arm on every JDK.**
+> That is at or below the pre-merge figure everywhere, so **merging did not move the untraced
+> cost**.
+>
+> **The number that DID move, stated rather than hidden.** The contended arm at 10 threads on
+> JDK 17 measured **60.3 ns/op (7.2 ns per probe site)** against the pre-merge **43.5 ns/op
+> (3.4 ns/site)** — reproduced on a second run. It is **not** attributed to the merge, because
+> the code on that path (`TraceRuntime`'s `ThreadLocal` miss) is byte-identical and the
+> **`baseline` arm moved 23.074 → 16.8 ns/op in the same session**, i.e. the whole machine
+> profile differs from the pre-merge run. The honest statement is: *this session measures the
+> contended path higher than the recorded figure, the cause is unresolved, and the recorded
+> figure is not being re-quoted as if it had survived.* The single-thread contended figures
+> (1.33 ns on JDK 11, 2.55 ns on JDK 21, 2.57 ns on JDK 17) match the old run closely, which is
+> what makes machine state the leading explanation.
+
+*(Everything below this point is the PRE-MERGE measurement, from `ax-trace.jar`.)*
 
 > **Hazard, the same one `docs/TOOLCHAIN.md` #2 states for ax-agent's gates.** This is aarch64
 > (Apple M4, 10 cores, 128-byte line). Production is x86_64 Linux. A volatile int read is an
@@ -124,8 +194,8 @@ work, so their absolute figure includes JMH's own per-op floor, which differs by
 
 ### The verdict, plainly
 
-**The claim holds. 0.17–0.83 ns per probe site across JDK 11/17/21 and 1/4/10 threads,
-allocation-free everywhere.** An untraced request pays one `volatile int` load and one perfectly-predicted branch
+**The claim holds, before and after the merge. 0.17–0.83 ns per probe site pre-merge and
+0.17–0.76 ns post-merge, across JDK 11/17/21 and 1/4/10 threads, allocation-free everywhere.** An untraced request pays one `volatile int` load and one perfectly-predicted branch
 per probe site, and nothing else — no thread-local read, no clock, no allocation.
 
 For scale: G1 rejected ax-agent's blind tier-1 store at **+0.72–0.77 ns/probe** as too expensive.
@@ -137,8 +207,9 @@ baseline).
 ### The number that is NOT near-zero, and it is not hidden
 
 **While ANY thread is inside a traced request, every OTHER thread's probes fall through the gate
-into a `ThreadLocal.get()` that finds nothing: 2.6–5.0 ns per probe site.** That is 4–8× the
-untraced cost.
+into a `ThreadLocal.get()` that finds nothing: 2.6–5.0 ns per probe site pre-merge, and up to
+7.2 ns/site at 10 threads in the post-merge session (see the re-measurement note above).** That is
+4–17× the untraced cost.
 
 This is the same trade `EdgeRuntime` documents for the call-edge tier, and it is bounded by the
 same two things: the rate cap (5 traces/minute default) and `max.concurrent=1`. A trace of a
@@ -190,7 +261,7 @@ see a method that filters a collection *in place*.
    tails, Aadhaar), 10-digit runs beginning 6–9 (Indian mobiles), `@`-with-a-dot, PAN-shaped
    `AAAAA9999A`. It exists because the name gate cannot see through `getRef`, `getCode`, `getNum`.
 
-**There was no redaction denylist anywhere in the auxin tree before this module** — checked with
+**There was no redaction denylist anywhere in the auxin tree before this tier** — checked with
 `grep -rn 'redact|denylist|PII|scrub'`, which matched only prose in `docs/`. This is the first
 one, so it is documented here rather than adopted.
 
@@ -258,7 +329,10 @@ instrumented — what they were missing was a context.
 3. **Any class whose loader cannot resolve `io.auxin.trace.runtime.TraceRuntime`** — OSGi, JBoss
    Modules, a JPMS custom layer, some fat jars. Such classes are **skipped and counted**
    (`agentNotVisible`), never broken, because there is no bridge for a per-invocation call. This
-   is the same posture ax-agent takes for tier-2.
+   is the same posture tier-2 takes. Since the merge it is also the *same question*: one jar means
+   `ProbeHolder` and `TraceRuntime` share a loader, so `LoaderVisibility` answers for both and the
+   tracer's own copy of that logic was deleted. The consequences still differ — tier-1 reaches an
+   invisible loader through `java.lang.$Auxin` and this tier structurally cannot.
 
 ---
 
@@ -277,7 +351,9 @@ instrumented — what they were missing was a context.
   `TraceGate.end()` is what decrements the global gate; an entry that could leak it would make
   every probe in the JVM pay a thread-local read for ever.
 - **Trivial accessors are not traced.** `docs/CONTRACTS.md` §1's C51 rule, re-derived from the
-  instruction list because this module has no build manifest. Measured: `Fare#getStops`,
+  instruction list. *(Post-merge the manifest is often present — the tracer still re-derives,
+  because its scope is independent of `ax.include.packages` and a traced class need not be in the
+  manifest at all.)* Measured: `Fare#getStops`,
   `Fare#isRefundable` and `Fare$Carrier#values` alone were **519 of 865 frames** in the first
   document the smoke suite produced. Counted as `trivialAccessor`.
 - **Branch selection is a heuristic.** The default `predicates` mode records a conditional whose
@@ -290,8 +366,8 @@ instrumented — what they were missing was a context.
   different type. It does not, and the value is passed as `Object` with every decision made at
   runtime, so the worst case is an uninteresting observation rather than a type error. A
   non-javac frontend with aggressive slot reuse is untested.
-- **Dynamic attach is refused**, harder than ax-agent refuses it: probes install at initial class
-  load only, so an attached tracer would report an armed gate and capture nothing.
+- **Dynamic attach is refused**, for the whole agent: probes install at initial class load only,
+  so an attached tracer would report an armed gate and capture nothing.
 - **Volume is bounded, not solved.** For one request against a five-method service the document
   is **66 KB / 149 emitted frames** from 328 recorded (176 folded, 3 collapsed). Both halves of
   the volume control — pass-through elision and identical-sibling folding — run on the dispatcher
@@ -306,13 +382,18 @@ instrumented — what they were missing was a context.
 
 | what | result |
 |---|---|
-| `smoke/run-trace-smoke.sh` on **JDK 11.0.32.1** | **53/53** |
-| `smoke/run-trace-smoke.sh` on **JDK 17.0.18** | **53/53** |
-| `smoke/run-trace-smoke.sh` on **JDK 21.0.12.1** | **53/53** |
+| `modules/ax-agent/smoke/run-trace-smoke.sh` on **JDK 11.0.32.1** | **72/72** (53 migrated + 19 new) |
+| `modules/ax-agent/smoke/run-trace-smoke.sh` on **JDK 17.0.18** | **72/72** (53 migrated + 19 new) |
+| `modules/ax-agent/smoke/run-trace-smoke.sh` on **JDK 21.0.12.1** | **72/72** (53 migrated + 19 new) |
+| — the migrated count is **asserted** to still be 53, not claimed | the script fails if it is not |
 | — of which, trace-document assertions | 41/41 per run |
-| — including **both agents in one JVM** (ax-trace + ax-agent, real manifest from ax-static) | no VerifyError, both armed, document produced, coverage probe not mistaken for a branch |
-| `bench/run-bench.sh` at 1 / 4 / 10 threads, JDK 17 | §3; **0 B/op on every untraced arm** |
-| `bench/run-bench.sh` at 1 thread, JDK 11 and JDK 21 | §3; **0 B/op on every untraced arm** |
+| — including **all four tiers in one JVM from one `-javaagent`** (tier-1 + tier-2 + edges + trace, real manifest from ax-static) | no VerifyError, document produced, coverage probe not mistaken for a branch |
+| `modules/ax-agent/smoke/run-smoke.sh` on 11 / 17 / 21 | 165×4, 161, 182, 163 + **38/38** javap — unchanged by the merge except one strengthened frame assertion |
+| `modules/ax-agent/smoke/run-negative.sh` on 11 / 17 / 21 | **159/159** |
+| `isolation/run-isolation.sh --jdk all` | **1146 / 0** |
+| `g5/run-g5.sh` | **972 / 0** |
+| `bench/run-gates.sh g7` at 1 / 4 / 10 threads, JDK 17 | §3; **0 B/op on every untraced arm** |
+| `bench/run-gates.sh g7` at 1 thread, JDK 11 and JDK 21 | §3; **0 B/op on every untraced arm** |
 
 ### Three real bugs the suite found, listed because they are the point of running it
 
@@ -328,6 +409,15 @@ instrumented — what they were missing was a context.
    assignable-*to*, not assignable-*from*. `emitEdgeRoot` gets away with it only because it is
    emitted last within one emitter; a separate agent cannot assume it is last. Fixed by declaring
    the receiver and the descriptor's arguments, which is what composes.
+
+   **The merge made this ProbeEmitter's problem too, and it is now fixed there as well.** The
+   trace tier is emitted LAST, so the edge root's handler block sits *inside* the trace tier's
+   protected range — the identical configuration, with the roles reversed. `emitEdgeRoot` no
+   longer declares zero locals; it declares the receiver and the descriptor's arguments, and
+   nothing after them (tier-2's timing local is not yet assigned at the top of the edge range, so
+   declaring `LONG` there would be a lie the verifier catches). `run-smoke.sh` asserts zero
+   `locals = []` frames and six `locals = [ class smoke/EdgeTarget, int ]` frames; the trace suite
+   asserts the same shape on a method carrying all four tiers, on all three JDKs.
 3. **The tracer observed itself.** `Fare` is in the traced scope, so `Fare.getCarrier()` carries
    trace probes — and the projection *calls* `getCarrier()` reflectively, pushing a frame whose
    parameters are observed, which may project again. 1,328 of the first run's common-pool frames
@@ -340,7 +430,9 @@ loop *body* and found its `INVOKEVIRTUAL`. Fixed by stopping the walk at the bas
 
 ### Not verified
 
-- **x86_64 Linux.** Every number in §3 is aarch64. `bench/run-bench.sh` is one command there.
+- **x86_64 Linux.** Every number in §3 is aarch64. `bench/run-gates.sh g7` is one command there.
+- **Why the contended arm at 10 threads moved.** Named in §3; unresolved, and not attributed to
+  the merge on the evidence available.
 - **Class file version 50**, and **JDK 8 as a host** — no available JDK produces either.
 - **A real servlet container.** The smoke target uses stub `javax.servlet` interfaces, which
   produce byte-for-byte the real descriptors, so the **signature match and the activation

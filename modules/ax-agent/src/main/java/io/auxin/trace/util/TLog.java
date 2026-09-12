@@ -1,9 +1,13 @@
 package io.auxin.trace.util;
 
 /**
- * stderr logging, no dependencies, never throws. A copy of {@code io.auxin.agent.util.Log}'s
- * shape with a distinct prefix ({@code [ax-trace]}) so that two agents in one JVM can be told
- * apart in a log, and so that this module depends on nothing in ax-agent.
+ * stderr logging, no dependencies, never throws. {@code io.auxin.agent.util.Log}'s shape with a
+ * distinct prefix ({@code [auxin/trace]}) so a reader can tell which TIER a line came from.
+ *
+ * <p>It said {@code [ax-trace]} while the tracer was a separate {@code -javaagent}, which now
+ * reads as a second agent that no longer exists. The level still defaults to the agent's own
+ * ({@code ax.log.level}) unless {@code ax.trace.log.level} overrides it, so one switch quiets
+ * both unless an operator asks for otherwise.
  */
 public final class TLog {
 
@@ -40,7 +44,7 @@ public final class TLog {
 
     private static void out(String lvl, String msg, Throwable t) {
         try {
-            System.err.println("[ax-trace] " + lvl + " " + msg);
+            System.err.println("[auxin/trace] " + lvl + " " + msg);
             if (t != null && level >= DEBUG) t.printStackTrace();
         } catch (Throwable ignored) {
             // logging must never take the application down

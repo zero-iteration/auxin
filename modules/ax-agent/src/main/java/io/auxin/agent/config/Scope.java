@@ -75,6 +75,17 @@ public final class Scope {
 
     public boolean empty() { return include.length == 0; }
 
+    /**
+     * The include list as dotted package names, for scope-overlap analysis against the trace
+     * tier's own scope (SCOPE-v3.1). Diagnostics only: the actual per-class decision is always
+     * {@link #included(String)}, which does the segment-boundary match.
+     */
+    public List<String> includeDotted() {
+        List<String> out = new ArrayList<String>();
+        for (int i = 0; i < include.length; i++) out.add(include[i].replace('/', '.'));
+        return out;
+    }
+
     public String includeDescription() { return includeRaw.isEmpty() ? "<none>" : includeRaw.toString(); }
 
     public String excludeDescription() { return excludeRaw.isEmpty() ? "<none>" : excludeRaw.toString(); }

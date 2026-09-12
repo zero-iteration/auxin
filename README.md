@@ -49,6 +49,12 @@ Calibration: Picnic ran JaCoCo — heavier, branch-level probes — in productio
 JSON — so the generator's JDK is independent of the JVM under test. Build with 17, instrument an
 app on 8. `ax-server` is Python **>=3.12**, stdlib only.
 
+**One `-javaagent`, full stop (SCOPE-v3.1).** The per-request tracer used to ship as a second
+agent jar. It is a tier inside `ax-agent.jar` now, **off by default**; `ax.trace.enabled=true`
+turns it on, and when it is on Tier-1b's auto-strip is disabled for the intersection of
+`ax.trace.include.packages` and `ax.include.packages` — automatically, loudly, and nowhere else.
+`modules/ax-agent/docs/TRADE-OFFS.md` §2 is why.
+
 ## Layout
 
 ```
@@ -57,8 +63,10 @@ modules/
   ax-manifest   shared contract types + zero-dependency JSON   (Java 8)
   ax-static     ASM inventory, probe-index assignment, entry points, CHA call graph (Java 17)
   ax-agent      ProbeInstaller + ProbeStripper, condy probes, long[] ring, drain thread (Java 8)
+                + the per-request TRACE TIER (off by default: ax.trace.enabled=true)
+                docs/TRADE-OFFS.md and docs/TRACE-CONTRACT.md are its contract
   ax-server     store · collector · analysis · api · mcp        (Python 3, stdlib only)
-bench/     JMH gates G1-G4
+bench/     JMH gates G1-G4, G6 (call edges), G7 (the untraced trace-probe path)
 deploy/    Kyverno injection policy + Helm chart + PREFLIGHT + RUNBOOK
 demo/      dependency-free target app with MEASURED dead-code ground truth
 ```

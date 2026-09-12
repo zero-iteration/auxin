@@ -11,7 +11,9 @@
   <version>0.1.0-SNAPSHOT</version>
   <packaging>jar</packaging>
   <name>ax-agent</name>
-  <description>auxin JVM agent: condy probe installer + stripper, MPSC ring, drain thread</description>
+  <description>auxin JVM agent: condy probe installer + stripper, MPSC ring, drain thread,
+    call-edge tier, and the per-request trace tier (off by default). ONE -javaagent jar
+    (SCOPE-v3.1): io.auxin.trace.* ships here and has no premain of its own.</description>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -76,6 +78,11 @@
               <createDependencyReducedPom>false</createDependencyReducedPom>
               <shadedArtifactAttached>false</shadedArtifactAttached>
               <relocations>
+                <!-- ONE relocation. ax-trace deliberately used a DIFFERENT shaded package
+                     (io.auxin.trace.shaded.asm) so that neither agent's ASM could satisfy the
+                     other's; with one jar that argument is gone and a second copy would be
+                     ~120KB of metaspace buying nothing. io/auxin/trace/shaded/asm must not
+                     appear in the jar at all, and run-trace-smoke.sh asserts it. -->
                 <relocation>
                   <pattern>org.objectweb.asm</pattern>
                   <shadedPattern>io.auxin.shaded.asm</shadedPattern>

@@ -43,6 +43,17 @@ public final class IgnoreRules {
     /** Our shaded ASM's root package, e.g. {@code io/auxin/shaded/asm/}. */
     private static final String ASM_RUNTIME = asmRuntimePrefix();
 
+    /**
+     * The per-request trace tier's runtime (SCOPE-v3.1), e.g. {@code io/auxin/trace/}. It ships
+     * in the same jar as everything else now, so it is one more hard veto rather than a second
+     * agent's problem: every trace probe is an {@code INVOKESTATIC} into it, and instrumenting
+     * the probe target is unbounded recursion.
+     *
+     * <p>Derived the same way the agent's own prefix is, so a relocated build vetoes the
+     * relocated names and does NOT keep vetoing a customer's {@code io.auxin.*}.
+     */
+    private static final String TRACE_RUNTIME = traceRuntimePrefix();
+
     /** Vetoed regardless of {@code ax.include.packages}. Order: cheapest/commonest first. */
     private static final String[] HARD = {
             "java/",
@@ -52,6 +63,7 @@ public final class IgnoreRules {
             "javax/",
             AGENT_RUNTIME,
             ASM_RUNTIME,
+            TRACE_RUNTIME,
     };
 
     /** Other agents' runtimes. Vetoed only when the include scope is less specific. */
@@ -122,7 +134,8 @@ public final class IgnoreRules {
      * reported once, at premain, where there is nothing to recurse into.
      */
     public static boolean isOwnRuntime(String hardPrefix) {
-        return AGENT_RUNTIME.equals(hardPrefix) || ASM_RUNTIME.equals(hardPrefix);
+        return AGENT_RUNTIME.equals(hardPrefix) || ASM_RUNTIME.equals(hardPrefix)
+                || TRACE_RUNTIME.equals(hardPrefix);
     }
 
     /** Runtime-generated classes: never probed (CONTRACTS section 1, A14 defect 3). */
@@ -136,6 +149,9 @@ public final class IgnoreRules {
     /** The shaded-ASM package prefix, for the startup log. */
     public static String asmRuntime() { return ASM_RUNTIME; }
 
+    /** The trace tier's runtime package prefix, for the startup log. */
+    public static String traceRuntime() { return TRACE_RUNTIME; }
+
     // ---- deriving our own identity, so a relocated build says the truth about itself ----
 
     /**
@@ -147,6 +163,15 @@ public final class IgnoreRules {
     private static String agentRuntimePrefix() {
         String p = parentPackage(packagePrefix(IgnoreRules.class));
         return sane(p) ? p : "io/auxin/agent/";
+    }
+
+    /**
+     * {@code io.auxin.trace.runtime.TraceRuntime} -> {@code io/auxin/trace/}: two segments up
+     * from the runtime package, the same derivation {@link #agentRuntimePrefix} uses.
+     */
+    private static String traceRuntimePrefix() {
+        String p = parentPackage(packagePrefix(io.auxin.trace.runtime.TraceRuntime.class));
+        return sane(p) ? p : "io/auxin/trace/";
     }
 
     private static String asmRuntimePrefix() {

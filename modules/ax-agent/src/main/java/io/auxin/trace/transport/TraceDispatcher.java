@@ -46,7 +46,7 @@ public final class TraceDispatcher implements TraceGate.TraceSink, Runnable {
     }
 
     public void start() {
-        Thread t = new Thread(this, "ax-trace-dispatch");
+        Thread t = new Thread(this, "auxin-trace-dispatch");
         t.setDaemon(true);                      // never hold up JVM exit
         t.setPriority(Thread.MIN_PRIORITY);     // a trace must never outbid the application
         thread = t;

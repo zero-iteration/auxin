@@ -9,6 +9,8 @@ import io.auxin.agent.runtime.BootstrapBridge;
 import io.auxin.agent.runtime.EdgeRegistry;
 import io.auxin.agent.runtime.Tier2Registry;
 import io.auxin.agent.util.Log;
+import io.auxin.trace.instrument.EntrySignatures;
+import io.auxin.trace.instrument.TraceEmitter;
 import org.objectweb.asm.ConstantDynamic;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
@@ -114,6 +116,45 @@ import java.util.List;
  *
  * <h3>Index assignment</h3>
  * Always a lookup in the build-time manifest, NEVER visit order (A14 defect 2).
+ *
+ * <h3>EMISSION ORDER, and why it is load bearing (SCOPE-v3.1)</h3>
+ * Four tiers can now land in one method. Every one of them prepends its prologue with
+ * {@code instructions.insert} and appends its epilogue with {@code instructions.add}, so
+ * <b>the tier emitted LAST ends up outermost</b>: its {@code tryStart} is earliest and its
+ * {@code tryEnd} is latest, and therefore its protected range covers every earlier tier's
+ * handler block. The order is fixed and it is:
+ * <pre>
+ *   1. tier-2   (try/finally + timing local)   innermost
+ *   2. tier-1   (the coverage probe)
+ *   3. edges    (rootEnter/rootExit + handler)
+ *   4. TRACE    (gate + frames + handler)      outermost
+ * </pre>
+ * <ol>
+ *   <li><b>tier-2 first</b> so that {@code framesAreExpanded(m)} still sees only the class's
+ *       own frames, and so that {@code extendFrameLocals} teaches every pre-existing frame about
+ *       its timing local before anyone adds another one.</li>
+ *   <li><b>tier-1 second</b> so that {@link #entryFrameLabel} still finds a frame that was
+ *       genuinely at offset 0 in the original method, rather than one pushed down by a
+ *       prologue we emitted.</li>
+ *   <li><b>edges third</b>: its try range has to cover tier-2's handler, or an exception leaving
+ *       a boundary method would leak the sampling gate.</li>
+ *   <li><b>TRACE LAST, and therefore outermost.</b> {@code TraceGate.end()} is what decrements
+ *       the global trace gate; a leaked gate makes every probe in the JVM pay a thread-local
+ *       read for ever, which is the one failure mode here that costs real money. So the trace
+ *       handler must be the last thing an escaping exception passes.</li>
+ * </ol>
+ *
+ * <p><b>The consequence, and the bug it would otherwise be.</b> Because trace is outermost, the
+ * edge tier's handler block now sits INSIDE the trace tier's protected range. The trace
+ * handler's frame names the receiver type, so control flowing out of the edge handler into it
+ * must arrive with locals[0] already assignable to that type. {@link #emitEdgeRoot} used to
+ * declare <b>zero locals</b> — sound only because it was emitted last within one emitter, which
+ * it no longer is — and that produced exactly
+ * <pre>VerifyError: Type top (current frame, locals[0]) is not assignable to 'x/SearchFilter'</pre>
+ * when the tracer was a separate agent. {@code top} is assignable-<i>to</i>, not
+ * assignable-<i>from</i>. Every handler frame emitted from this file therefore declares the
+ * receiver and the descriptor's arguments honestly; see {@link #handlerFrameLocals} and
+ * {@link #edgeHandlerFrameLocals}.
  */
 public final class ProbeEmitter {
 
@@ -222,7 +263,20 @@ public final class ProbeEmitter {
          */
         public boolean[] installedProbes;
 
-        public boolean changed() { return probes > 0 || tier2Methods > 0 || edgeMethods > 0; }
+        /** Methods carrying per-request trace instrumentation (SCOPE-v3.1). */
+        public int traceMethods;
+        /** Servlet entries carrying {@code TraceGate.begin} / {@code end}. */
+        public int traceEntries;
+        /** Branch-arm probes emitted by the trace tier. */
+        public int traceArms;
+        /** Executor call sites rewritten by the trace tier. */
+        public int traceWrappedCallSites;
+        /** True when the trace tier is the reason this class was rewritten. */
+        public boolean traceChanged;
+
+        public boolean changed() {
+            return probes > 0 || tier2Methods > 0 || edgeMethods > 0 || traceChanged;
+        }
     }
 
     private final boolean tier1Enabled;
@@ -232,25 +286,107 @@ public final class ProbeEmitter {
     private final boolean condyArrayDescriptor;
     private final boolean selfBsmBridge;
 
-    public ProbeEmitter(Options options) {
+    /**
+     * The per-request trace tier, or null when {@code ax.trace.enabled=false} — which is the
+     * default, and in that state not one instruction of it is reachable from here.
+     */
+    private final TraceEmitter traceEmitter;
+
+    /**
+     * @param traceArmed did the trace tier actually arm at premain? NOT the same question as
+     *                   {@code ax.trace.enabled=true}: the tier can be configured on and still
+     *                   refuse to arm — no scope, a production JVM with no token, or
+     *                   {@code ax.trace.strip.conflict=refuse} with a live scope overlap. In
+     *                   every one of those cases {@code TraceRuntime} is never installed, so
+     *                   emitting a probe that calls it would instrument a class against a
+     *                   runtime that is not there. The switch is not the arming decision, and
+     *                   reading it as one instrumented 17 methods in a JVM that had refused.
+     */
+    public ProbeEmitter(Options options, boolean traceArmed) {
         this.tier1Enabled = options.tier1Enabled;
         this.tier2Enabled = options.tier2Enabled;
         this.edgesEnabled = options.edgesEnabled;
         this.blindMode = Options.PROBE_MODE_BLIND.equals(options.probeMode);
         this.condyArrayDescriptor = options.condyArrayDescriptor;
         this.selfBsmBridge = Options.BRIDGE_SHAPE_SELF_BSM.equals(options.bridgeShape);
+        this.traceEmitter = traceArmed
+                ? new TraceEmitter(options.trace, new EntrySignatures(options.trace.entrySignatures))
+                : null;
+    }
+
+    /** Is the per-request trace tier armed in this emitter? */
+    public boolean traceArmed() { return traceEmitter != null; }
+
+    /**
+     * Walks {@code cn} through the TRACE emitter with both scopes false, so every method is
+     * visited and none is instrumented.
+     *
+     * <p>Exists only for {@link ProbeInstaller#warmUp(byte[])}, and it is not redundant with the
+     * warm-up's call to {@link #instrument}: that call passes both trace scopes false, which
+     * makes {@code instrument} skip this emitter <em>entirely</em> — so without this the trace
+     * emitter and everything it touches would first be resolved from inside {@code transform()},
+     * which is exactly the re-entrant load that produced
+     * {@code LinkageError: attempted duplicate class definition} and a half-armed agent.
+     */
+    void warmTrace(ClassNode cn) {
+        if (traceEmitter != null) traceEmitter.instrument(cn, false, false);
     }
 
     /**
-     * Mutates {@code cn} in place.
+     * Mutates {@code cn} in place, running every armed tier over it in the ONE fixed order
+     * documented on this class.
+     *
+     * <p>The two halves are independent in both directions, which is the point of scoping them
+     * separately: a class that is in {@code ax.trace.include.packages} but carries no manifest
+     * entry gets trace instrumentation and no probe; a class in {@code ax.include.packages} and
+     * outside the traced scope gets exactly what it got before this tier existed, byte for byte.
+     *
+     * @param entry        the build manifest entry, or null when this class is outside
+     *                     {@code ax.include.packages} / absent from the manifest. Null means the
+     *                     coverage, tier-2 and edge tiers are skipped entirely.
+     * @param agentVisible can code loaded by this class's loader resolve {@code ProbeHolder}?
+     *                     When false the {@code java.lang} bridge is the only legal way to reach
+     *                     the probe array; see {@link LoaderVisibility}.
+     * @param inTraceScope is this class inside {@code ax.trace.include.packages}?
+     * @param inEntryScope is this class searched for a servlet entry?
+     * @return what was done, or a Result carrying a skipReason and no changes.
+     */
+    public Result instrument(ClassNode cn, Manifest.ClassEntry entry, boolean agentVisible,
+                             boolean inTraceScope, boolean inEntryScope) {
+        Result r = new Result();
+
+        // 1-3: tier-2, tier-1, edges. Skipped wholesale when this class is not ours to probe.
+        if (entry != null) emitAgentTiers(cn, entry, agentVisible, r);
+
+        // 4: THE TRACE TIER, LAST AND THEREFORE OUTERMOST. See the emission-order section on
+        // this class -- being last is what lets TraceGate.end() run after every other tier's
+        // handler, and it is why emitEdgeRoot now has to declare its frame honestly.
+        //
+        // An agent-tier skipReason does NOT suppress it: "this class has no manifest entry" and
+        // "this class is in the traced scope" are different facts about different scopes, and
+        // letting the first veto the second would silently make the tracer's own default-deny
+        // scope subordinate to the coverage scope.
+        if (traceEmitter != null && (inTraceScope || inEntryScope)) {
+            TraceEmitter.Result tr = traceEmitter.instrument(cn, inTraceScope, inEntryScope);
+            r.traceMethods = tr.methods;
+            r.traceEntries = tr.entries;
+            r.traceArms = tr.arms;
+            r.traceWrappedCallSites = tr.wrappedCallSites;
+            r.traceChanged = tr.changed();
+        }
+        return r;
+    }
+
+    /**
+     * Tiers 1, 1b-eligible and 2 plus the call-edge tier: everything that comes out of the build
+     * manifest. Mutates {@code cn} in place and records into {@code r}.
      *
      * @param agentVisible can code loaded by this class's loader resolve {@code ProbeHolder}?
      *                     When false the {@code java.lang} bridge is the only legal way to reach
      *                     the probe array; see {@link LoaderVisibility}.
-     * @return what was done, or a Result carrying a skipReason and no changes.
      */
-    public Result instrument(ClassNode cn, Manifest.ClassEntry entry, boolean agentVisible) {
-        Result r = new Result();
+    private void emitAgentTiers(ClassNode cn, Manifest.ClassEntry entry,
+                                boolean agentVisible, Result r) {
 
         List<MethodNode> eligible = new ArrayList<MethodNode>();
         List<String[]> schemaKeys = new ArrayList<String[]>();
@@ -262,7 +398,7 @@ public final class ProbeEmitter {
         }
         if (eligible.isEmpty()) {
             r.skipReason = Health.SKIP_NO_ELIGIBLE_METHODS;
-            return r;
+            return;
         }
 
         // CONTRACTS section 1: refuse to probe a class whose computed hash differs.
@@ -270,7 +406,7 @@ public final class ProbeEmitter {
             String computed = SchemaHash.compute(schemaKeys);
             if (!computed.equals(entry.schemaHash)) {
                 r.skipReason = Health.SKIP_SCHEMA_HASH_MISMATCH;
-                return r;
+                return;
             }
         }
 
@@ -284,7 +420,7 @@ public final class ProbeEmitter {
             // throw NoClassDefFoundError inside application code.
             if (!BootstrapBridge.installed()) {
                 r.skipReason = Health.SKIP_AGENT_NOT_VISIBLE;
-                return r;
+                return;
             }
             // F3: re-checked here as well as in pass 1, because the two reads straddle the
             // ASM parse and the field is writable by anything in the JVM at any moment. With the
@@ -292,7 +428,7 @@ public final class ProbeEmitter {
             // bridgeBootstrap), so this is now the outer of two defences, not the only one.
             if (!BootstrapBridge.intact()) {
                 r.skipReason = Health.SKIP_BRIDGE_TAMPERED;
-                return r;
+                return;
             }
             // F2: keep condy wherever condy exists. Below 55 there is no condy at all, so the
             // field prologue remains the only mechanism there.
@@ -307,7 +443,7 @@ public final class ProbeEmitter {
             // an interface cannot hold a mutable static field, and the field is the only way in
             r.skipReason = access == ACCESS_FIELD_BRIDGE
                     ? Health.SKIP_INTERFACE_NEEDS_FIELD : Health.SKIP_LEGACY_INTERFACE;
-            return r;
+            return;
         }
         r.access = access;
         r.usedCondy = !needsField(access);
@@ -332,7 +468,7 @@ public final class ProbeEmitter {
                 // Either this class is already instrumented or it genuinely declares the name.
                 // Retargeting an existing method as a bootstrap method is not survivable.
                 r.skipReason = Health.SKIP_BRIDGE_BSM_UNAVAILABLE;
-                return r;
+                return;
             }
             // REF_invokeStatic on the class's OWN name: the constant pool still names nothing
             // from io/auxin. isInterface must be true for an interface, or the CP entry is
@@ -445,7 +581,6 @@ public final class ProbeEmitter {
                 addFieldAndClinit(cn, dotted, entry.probeCount, access);
             }
         }
-        return r;
     }
 
     /** Does this delivery mechanism need a mutable static field on the instrumented class? */
@@ -955,7 +1090,7 @@ public final class ProbeEmitter {
             if (root && "<init>".equals(m.name)) return false;
             final int edgeId = EdgeRegistry.register(dotted, idx);
             if (edgeId < 0) return false;                   // 24-bit id space exhausted
-            return root ? emitEdgeRoot(m, edgeId, version) : emitEdgeCallee(m, edgeId);
+            return root ? emitEdgeRoot(cn.name, m, edgeId, version) : emitEdgeCallee(m, edgeId);
         } catch (Throwable t) {
             Log.debug("edge emission failed for " + cn.name + "#" + m.name, t);
             return false;
@@ -1014,13 +1149,29 @@ public final class ProbeEmitter {
      * the exceptional path too, and a boundary method throwing is not hypothetical (the smoke
      * suite's own {@code boundary(-1)} does).
      *
-     * <p><b>The frame.</b> One entry declaring <b>zero locals</b> and a single
-     * {@code java/lang/Throwable} on the stack. Zero locals is not laziness: the handler reads
-     * no local at all (the id is a bytecode constant and the throwable is on the stack), and an
-     * undeclared local is {@code top}, which every actual type is assignable to. Declaring the
-     * real local layout would mean re-deriving it after tier-2 has already added its own slot —
-     * more code, and every extra named type is another chance to name it wrong, which is a
-     * VerifyError at class definition rather than a missing edge.
+     * <p><b>The frame, and the bug that changed it (SCOPE-v3.1).</b> One entry declaring the
+     * <b>receiver and the descriptor's arguments</b>, and a single {@code java/lang/Throwable}
+     * on the stack.
+     *
+     * <p>It declared <b>zero locals</b> until the trace tier moved into this emitter. The
+     * argument for zero was: the handler reads no local at all (the id is a bytecode constant,
+     * the throwable is on the stack), and an undeclared local is {@code top}, which every actual
+     * type is assignable <i>to</i>. That argument is sound <b>only while this handler block sits
+     * outside every other protected range</b> — i.e. only while edges are emitted last. They are
+     * not: the trace tier is emitted after them and its range covers this handler block, so
+     * control can flow from here into a handler whose frame NAMES the receiver type, and
+     * {@code top} is not assignable <i>from</i>. As a separate agent the tracer hit precisely
+     * this:
+     * <pre>VerifyError: Type top (current frame, locals[0]) is not assignable to 'x/SearchFilter'</pre>
+     * Declaring the real layout is the version that composes, and it cannot be got wrong: the
+     * receiver and the arguments come from the method's own descriptor, and {@code <init>} — the
+     * one place local 0 is {@code uninitializedThis} — never reaches here ({@link #emitEdge}
+     * refuses a constructor root).
+     *
+     * <p>Nothing is declared beyond the arguments, and that is deliberate: this range STARTS
+     * before tier-2's {@code LSTORE}, so tier-2's timing local is not yet definitely assigned
+     * at the top of it and declaring {@code LONG} there would be a lie the verifier catches.
+     * Undeclared trailing slots are {@code top}, which is the correct answer for them.
      *
      * <p>It is written {@code F_NEW} when the method's other frames are expanded and
      * {@code F_FULL} when they are compressed, because ASM cannot mix the two within one method.
@@ -1033,7 +1184,7 @@ public final class ProbeEmitter {
      * the exception table in order and tier-2's entry is added first, so tier-2 still classifies
      * the error. It then rethrows from inside our range, and we close the trace.
      */
-    private static boolean emitEdgeRoot(MethodNode m, int edgeId, int version) {
+    private static boolean emitEdgeRoot(String owner, MethodNode m, int edgeId, int version) {
         final LabelNode tryStart = new LabelNode();
         final LabelNode tryEnd = new LabelNode();
         final LabelNode handler = new LabelNode();
@@ -1050,8 +1201,9 @@ public final class ProbeEmitter {
         post.add(tryEnd);
         post.add(handler);
         if (version >= FRAMES_MIN_VERSION) {
+            final Object[] locals = edgeHandlerFrameLocals(owner, m);
             post.add(new FrameNode(hasExpandedFrame(m) ? Opcodes.F_NEW : Opcodes.F_FULL,
-                    0, new Object[0], 1, new Object[]{"java/lang/Throwable"}));
+                    locals.length, locals, 1, new Object[]{"java/lang/Throwable"}));
         }
         push(post, edgeId);
         post.add(new MethodInsnNode(Opcodes.INVOKESTATIC, EDGE, EDGE_ROOT_EXIT, EDGE_DESC, false));
@@ -1063,6 +1215,28 @@ public final class ProbeEmitter {
 
         m.maxStack = Math.max(m.maxStack + 1, 2);
         return true;
+    }
+
+    /**
+     * Locals for the edge root's handler frame: the receiver (if any) and the declared
+     * arguments, and nothing after them.
+     *
+     * <p>Deliberately NOT padded to {@code m.maxLocals} the way {@link #handlerFrameLocals} is.
+     * Tier-2 has already run by this point and {@code m.maxLocals} now includes its timing slot
+     * and its exception slot — but this tier's protected range begins BEFORE tier-2's
+     * {@code LSTORE}, so at the top of the range those slots hold nothing. Undeclared trailing
+     * locals are {@code top}, which is exactly right for them; declaring anything else would be
+     * a claim the verifier can falsify.
+     *
+     * <p>A static method with no arguments therefore still declares zero locals, and that is
+     * correct rather than lazy: there is no local in scope to name.
+     */
+    private static Object[] edgeHandlerFrameLocals(String owner, MethodNode m) {
+        List<Object> locals = new ArrayList<Object>();
+        if ((m.access & Opcodes.ACC_STATIC) == 0) locals.add(owner);
+        Type[] args = Type.getArgumentTypes(m.desc);
+        for (int i = 0; i < args.length; i++) locals.add(frameType(args[i]));
+        return locals.toArray();
     }
 
     /** {@code push id; INVOKESTATIC EdgeRuntime.<name>(I)V} before every return in the method. */

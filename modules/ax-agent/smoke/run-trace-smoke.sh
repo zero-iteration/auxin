@@ -1,37 +1,53 @@
 #!/usr/bin/env bash
-# END-TO-END SMOKE TEST for the auxin per-request tracer (modules/ax-trace).
+# END-TO-END SMOKE TEST for the auxin per-request TRACE TIER.
 #
-#   build ax-trace -> compile a target app with a SERVLET-SHAPED ENTRY (real javax.servlet
+# MIGRATED, NOT REWRITTEN (SCOPE-v3.1). This was modules/ax-trace/smoke/run-trace-smoke.sh and
+# its 53 assertions ran against a second -javaagent. The tracer is now a tier inside ax-agent,
+# so every one of those 53 runs against the MERGED jar here, and the new SCOPE-v3.1 claims are
+# added after them in their own section. The two counts are tracked separately and the migrated
+# count is asserted to still be 53, so "nothing was lost in the merge" is checked rather than
+# claimed.
+#
+#   build ax-agent -> compile a target app with a SERVLET-SHAPED ENTRY (real javax.servlet
 #   descriptors, via stub interfaces so no third-party jar enters the build), a thread pool, a
 #   parallelStream, a flag branch, a throw and a collection that shrinks in place
-#   -> run it under -javaagent nine times (inert / full / rate cap / token / production-no-token
-#      / Tier-1b conflict refuse / Tier-1b conflict disable-strip / no-parallelstream-window /
-#      fail-open) against a REAL collector on POST /v1/trace
+#   -> run it under ONE -javaagent ten times (inert / full / rate cap / token /
+#      production-no-token / Tier-1b overlap refuse / Tier-1b overlap disable-strip /
+#      no-parallelstream-window / fail-open / SCOPED STRIP) against a REAL collector on
+#      POST /v1/trace
 #   -> assert the trace documents with python3 and the emitted bytecode with javap
 #
 # Every assertion prints PASS or FAIL. Exits non-zero on the first failing assertion set.
 #
-# In the style of modules/ax-agent/smoke/run-smoke.sh, and deliberately NOT sharing anything
-# with it: this module must be verifiable on its own.
+# Its own script, next to run-smoke.sh and run-negative.sh, sharing no state with them: it has
+# its own output directory because ax-static inventories whatever is in it, and a run of one
+# suite must never decide what another suite sees.
 set -uo pipefail
 
 MODULE="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$MODULE/smoke/out"
+OUT="$MODULE/smoke/out-trace"
 : "${JAVA_HOME:=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home}"
 JAVA="$JAVA_HOME/bin/java"
 JAVAC="$JAVA_HOME/bin/javac"
 JAVAP="$JAVA_HOME/bin/javap"
-AGENT="$MODULE/target/ax-trace.jar"
-AXAGENT="$MODULE/../ax-agent/target/ax-agent.jar"
+# ONE JAR. There is no second -javaagent any more.
+AGENT="$MODULE/target/ax-agent.jar"
 
 fails=0
 checks=0
+# Assertions added by SCOPE-v3.1. Tracked separately so that (checks - newchecks) is exactly the
+# migrated suite, and can be asserted to still be 53.
+newchecks=0
 ok()   { checks=$((checks+1)); echo "  PASS  $1"; }
 bad()  { checks=$((checks+1)); fails=$((fails+1)); echo "  FAIL  $1"; }
 check(){ checks=$((checks+1))                        # check <what> <expected> <actual>
   if [ "$2" = "$3" ]; then echo "  PASS  $1"
   else echo "  FAIL  $1 (expected '$2', got '$3')"; fails=$((fails+1)); fi
 }
+# The same three, for an assertion that did not exist before the merge.
+nok()   { newchecks=$((newchecks+1)); ok "$1"; }
+nbad()  { newchecks=$((newchecks+1)); bad "$1"; }
+ncheck(){ newchecks=$((newchecks+1)); check "$1" "$2" "$3"; }
 
 echo "== 0. environment =="
 echo "  java  : $("$JAVA" -version 2>&1 | head -1)"
@@ -39,20 +55,29 @@ echo "  arch  : $(uname -m)  cores=$(sysctl -n hw.logicalcpu 2>/dev/null || npro
 echo "  module: $MODULE"
 
 echo
-echo "== 1. build the tracer =="
+echo "== 1. build the ONE agent =="
 (cd "$MODULE" && mvn -o -q clean package) || { echo "FATAL: mvn package failed" >&2; exit 3; }
 ls -l "$AGENT"
-# Zero third-party runtime deps beyond shaded ASM: asserted, not claimed.
+# Zero third-party runtime deps beyond shaded ASM: asserted, not claimed. The scope widened from
+# io/auxin/trace/** to io/auxin/** because there is one jar now.
 FOREIGN="$(unzip -Z1 "$AGENT" '*.class' \
-  | grep -v '^io/auxin/trace/' | grep -v '^module-info' || true)"
-if [ -z "$FOREIGN" ]; then ok "the shipped jar contains ONLY io/auxin/trace/** classes"
+  | grep -v '^io/auxin/' | grep -v '^module-info' || true)"
+if [ -z "$FOREIGN" ]; then ok "the shipped jar contains ONLY io/auxin/** classes"
 else bad "the shipped jar contains foreign classes: $(echo "$FOREIGN" | head -3 | tr '\n' ' ')"; fi
-ASMCOUNT="$(unzip -Z1 "$AGENT" 'io/auxin/trace/shaded/asm/*.class' | wc -l | tr -d ' ')"
-if [ "$ASMCOUNT" -gt 10 ]; then ok "ASM is shaded into io/auxin/trace/shaded/asm ($ASMCOUNT classes)"
-else bad "ASM does not appear to be shaded (found $ASMCOUNT classes)"; fi
-if unzip -p "$AGENT" META-INF/MANIFEST.MF | grep -q 'Can-Retransform-Classes: false'; then
-  ok "the manifest declares Can-Retransform-Classes: false (a trace probe is never stripped)"
-else bad "the manifest should declare Can-Retransform-Classes: false"; fi
+# ONE RELOCATION. The two modules deliberately relocated ASM to different packages so that
+# neither agent's copy could satisfy the other's; one jar needs exactly one, and the old trace
+# relocation must be gone rather than merely unused.
+ASMCOUNT="$(unzip -Z1 "$AGENT" 'io/auxin/shaded/asm/*.class' | wc -l | tr -d ' ')"
+TRACEASM="$(unzip -Z1 "$AGENT" 'io/auxin/trace/shaded/asm/*.class' 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$ASMCOUNT" -gt 10 ] && [ "$TRACEASM" = "0" ]; then
+  ok "ASM is shaded ONCE, into io/auxin/shaded/asm ($ASMCOUNT classes), and io/auxin/trace/shaded/asm is gone"
+else bad "expected one ASM relocation (io/auxin/shaded/asm=$ASMCOUNT, io/auxin/trace/shaded/asm=$TRACEASM)"; fi
+# ONE PREMAIN. This is the headline of the merge, so it is an assertion.
+PREMAINS="$(unzip -p "$AGENT" META-INF/MANIFEST.MF | grep -c '^Premain-Class:' || true)"
+PREMAIN="$(unzip -p "$AGENT" META-INF/MANIFEST.MF | awk -F': ' '/^Premain-Class:/{print $2}' | tr -d '\r')"
+if [ "$PREMAINS" = "1" ] && [ "$PREMAIN" = "io.auxin.agent.AuxinAgent" ]; then
+  ok "exactly one Premain-Class and it is io.auxin.agent.AuxinAgent (io.auxin.trace.TraceAgent is gone)"
+else bad "expected one Premain-Class io.auxin.agent.AuxinAgent, got $PREMAINS: '$PREMAIN'"; fi
 
 echo
 echo "== 2. compile the target app (--release 8, so class file 52 on every JDK) =="
@@ -69,6 +94,7 @@ mkdir -p "$OUT/classes"
     "$MODULE/smoke/src/traceapp/SearchService.java" \
     "$MODULE/smoke/src/traceapp/SearchFilter.java" \
     "$MODULE/smoke/src/traceapp/FakeRequest.java" \
+    "$MODULE/smoke/src/stripcheck/Plain.java" \
     "$MODULE/smoke/src/tracerun/TraceApp.java" 2>&1 | grep -v '^Note' || true
 if [ ! -f "$OUT/classes/traceapp/SearchFilter.class" ]; then
   echo "FATAL: the target app did not compile" >&2; exit 3
@@ -80,6 +106,38 @@ if "$JAVAP" -p "$OUT/classes/traceapp/SearchFilter.class" | grep -q \
    'void doFilter(javax.servlet.ServletRequest, javax.servlet.ServletResponse, javax.servlet.FilterChain)'; then
   ok "the target filter has the real Filter#doFilter signature"
 else bad "the target filter does not have the Filter#doFilter signature"; fi
+
+echo
+echo "== 2b. generate the build manifest with the REAL ax-static =="
+# Needed by every run below that arms the COVERAGE side as well as the trace tier -- which is
+# now most of them, because one jar means the two tiers share a premain and the interesting
+# assertions are about how they interact. There is no substitute generator here for the same
+# reason run-smoke.sh refuses one.
+AXSTATIC="$MODULE/../ax-static/target/ax-static.jar"
+MANIFEST=""
+if [ -f "$AXSTATIC" ]; then
+  # ax-static targets release 17; this suite runs on 11, 17 and 21. The generator is a BUILD-TIME
+  # tool whose only output is JSON, so the JDK that runs it is independent of the JVM under test.
+  AXSTATIC_JAVA="${AX_STATIC_JAVA:-/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home/bin/java}"
+  [ -x "$AXSTATIC_JAVA" ] || AXSTATIC_JAVA="$JAVA"
+  # --tier2 is explicit here for one reason: section 15 asserts that ONE METHOD carries tier-1,
+  # tier-2, an edge root and a trace frame simultaneously. Tier-2 is what makes a method an edge
+  # ROOT (the shape with the handler), so without naming one the four-tier assertion would be
+  # checking a three-tier method and passing.
+  "$AXSTATIC_JAVA" -jar "$AXSTATIC" --input "$OUT/classes" --build-sha tracesmoke \
+      --artifact trace-smoke --output "$OUT/auxin-manifest.json" \
+      --tier2 'traceapp.SearchService#handle' \
+      --tier2-exclude 'tracerun.*#*' > /dev/null 2>&1
+  [ -f "$OUT/auxin-manifest.json" ] && MANIFEST="$OUT/auxin-manifest.json"
+fi
+if [ -n "$MANIFEST" ]; then
+  echo "  manifest: $MANIFEST ($(wc -c < "$MANIFEST" | tr -d ' ') bytes)"
+else
+  echo "  FATAL: no build manifest. The coverage side cannot arm, so the Tier-1b assertions" >&2
+  echo "         below would silently test nothing. Build it with:" >&2
+  echo "             (cd $MODULE/../ax-static && mvn -q clean package)" >&2
+  exit 3
+fi
 
 free_port() {
   python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'
@@ -328,35 +386,33 @@ check "RUN E: exactly 1 document (the two wrong values produced none)" "1" \
     "$(ls "$OUT/recv-token" 2>/dev/null | wc -l | tr -d ' ')"
 
 echo
-echo "== 8. RUN F: the TIER-1b MUTUAL EXCLUSION -- refuse (the default) =="
-if [ ! -f "$AXAGENT" ]; then
-  echo "  SKIP  ax-agent.jar is not built ($AXAGENT); the conflict check needs"
-  echo "        io.auxin.agent.AuxinAgent resolvable. Build it with:"
-  echo "            (cd $MODULE/../ax-agent && mvn -q clean package)"
-  bad "RUN F: Tier-1b conflict detection NOT EXERCISED (ax-agent.jar missing)"
-else
+echo "== 8. RUN F: the TIER-1b OVERLAP -- refuse (the pre-merge default, still reachable) =="
+{
   port="$(free_port)"; rm -rf "$OUT/recv-conflict"; mkdir -p "$OUT/recv-conflict"
   "$JAVA" -javaagent:"$AGENT" \
       -Dax.trace.enabled=true \
       -Dax.trace.include.packages=traceapp \
+      -Dax.trace.strip.conflict=refuse \
       -Dax.include.packages=traceapp \
+      -Dax.manifest="$OUT/auxin-manifest.json" \
+      -Dax.transport.enabled=false \
       -Dax.trace.collector.url="http://127.0.0.1:$port/v1/trace" \
       -Dtrace.smoke.scenario=conflict-refuse \
       -Dtrace.smoke.recv="$OUT/recv-conflict" \
       -Dtrace.smoke.port="$port" \
-      -cp "$OUT/classes:$AXAGENT" tracerun.TraceApp > "$OUT/log-conflict.txt" 2>&1
+      -cp "$OUT/classes" tracerun.TraceApp > "$OUT/log-conflict.txt" 2>&1
   rc=$?
   grep -E '^  (PASS|FAIL)|TIER-1b|strip.conflict' "$OUT/log-conflict.txt" || true
   tally "RUN F conflict=refuse" "$rc"
-  if grep -q 'TIER-1b / TRACE CONFLICT' "$OUT/log-conflict.txt"; then
-    ok "RUN F: the conflict is detected and named at startup"
-  else bad "RUN F: the Tier-1b conflict was NOT detected"; fi
+  if grep -q 'TIER-1b / TRACE OVERLAP' "$OUT/log-conflict.txt"; then
+    ok "RUN F: the overlap is detected and named at startup"
+  else bad "RUN F: the Tier-1b overlap was NOT detected"; fi
   if grep -q 'A TRACE PROBE CAN NEVER BE STRIPPED' "$OUT/log-conflict.txt"; then
     ok "RUN F: the message says WHY it is a contradiction, not just that it is one"
   else bad "RUN F: the message must explain why"; fi
-  if grep -q 'THE TRACER IS NOT ARMED' "$OUT/log-conflict.txt"; then
-    ok "RUN F: the default refuses the NEW thing, leaving ax-agent's promises intact"
-  else bad "RUN F: the default must refuse the tracer, not degrade ax-agent"; fi
+  if grep -q 'THE TRACE TIER IS NOT ARMED' "$OUT/log-conflict.txt"; then
+    ok "RUN F: refuse still refuses the NEW thing, leaving Tier-1b's promises intact"
+  else bad "RUN F: refuse must refuse the trace tier, not degrade Tier-1b"; fi
   if grep -qE 'ax.trace.strip.conflict=(disable-strip|allow)' "$OUT/log-conflict.txt"; then
     ok "RUN F: the message lists the ways out"
   else bad "RUN F: the message must list the ways out"; fi
@@ -364,69 +420,67 @@ else
       "$(ls "$OUT/recv-conflict" 2>/dev/null | wc -l | tr -d ' ')"
 
   echo
-  echo "== 9. RUN G: the TIER-1b MUTUAL EXCLUSION -- disable-strip, and it is VERIFIED =="
+  echo "== 9. RUN G: the TIER-1b OVERLAP -- disable-strip, THE DEFAULT, and it is SCOPED =="
+  # No -Dax.trace.strip.conflict here on purpose: disable-strip is the default now.
   port="$(free_port)"; rm -rf "$OUT/recv-ds"; mkdir -p "$OUT/recv-ds"
   "$JAVA" -javaagent:"$AGENT" \
       -Dax.trace.enabled=true \
       -Dax.trace.include.packages=traceapp \
-      -Dax.trace.strip.conflict=disable-strip \
       -Dax.include.packages=traceapp \
+      -Dax.manifest="$OUT/auxin-manifest.json" \
+      -Dax.transport.enabled=false \
       -Dax.trace.collector.url="http://127.0.0.1:$port/v1/trace" \
       -Dtrace.smoke.scenario=conflict-disablestrip \
       -Dtrace.smoke.recv="$OUT/recv-ds" \
       -Dtrace.smoke.port="$port" \
-      -cp "$OUT/classes:$AXAGENT" tracerun.TraceApp > "$OUT/log-ds.txt" 2>&1
+      -cp "$OUT/classes" tracerun.TraceApp > "$OUT/log-ds.txt" 2>&1
   rc=$?
   grep -E '^  (PASS|FAIL)|disable-strip|Tier-1b' "$OUT/log-ds.txt" || true
   tally "RUN G conflict=disable-strip" "$rc"
-  if grep -q 'Tier-1b auto-strip is being' "$OUT/log-ds.txt"; then
-    ok "RUN G: the startup line says Tier-1b was turned off, and why"
-  else bad "RUN G: expected a line saying Tier-1b was turned off"; fi
-  if grep -q 'ONLY WORKS IF -javaagent:ax-trace.jar PRECEDES' "$OUT/log-ds.txt"; then
-    ok "RUN G: the ordering requirement is stated rather than assumed"
-  else bad "RUN G: the ordering requirement must be stated"; fi
-  check "RUN G: the tracer armed and produced 1 document" "1" \
+  if grep -q 'TIER-1b AUTO-STRIP IS DISABLED FOR' "$OUT/log-ds.txt"; then
+    ok "RUN G: the startup line says Tier-1b was disabled, for which scope, and why"
+  else bad "RUN G: expected a line naming the scope Tier-1b was disabled for"; fi
+  # The old line promised an ORDERING ("-javaagent:ax-trace.jar must precede ax-agent.jar").
+  # One premain makes that ordering impossible to get wrong, so the assertion is now that the
+  # suppression is SCOPED -- the property that replaced the one the ordering was protecting.
+  if grep -q 'strip normally -- that is what the scope is for' "$OUT/log-ds.txt"; then
+    ok "RUN G: the message states that out-of-scope classes still strip, rather than assuming it"
+  else bad "RUN G: the message must state that out-of-scope classes still strip"; fi
+  check "RUN G: the trace tier armed and produced 1 document" "1" \
       "$(ls "$OUT/recv-ds" 2>/dev/null | wc -l | tr -d ' ')"
 
   echo
-  echo "== 9b. RUN H: BOTH AGENTS IN ONE JVM (coexistence) =="
-  AXSTATIC="$MODULE/../ax-static/target/ax-static.jar"
-  if [ ! -f "$AXSTATIC" ]; then
-    echo "  SKIP  ax-static.jar is not built; ax-agent needs a build manifest and there is no"
-    echo "        substitute generator (run-smoke.sh refuses one too). Coexistence UNTESTED."
-  else
-    # ax-static targets release 17; this suite runs on 11, 17 and 21. The generator is a
-    # BUILD-TIME tool whose only output is JSON, so the JDK that runs it is independent of the
-    # JVM under test -- the same argument run-smoke.sh makes.
-    AXSTATIC_JAVA="${AX_STATIC_JAVA:-/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home/bin/java}"
-    [ -x "$AXSTATIC_JAVA" ] || AXSTATIC_JAVA="$JAVA"
-    "$AXSTATIC_JAVA" -jar "$AXSTATIC" --input "$OUT/classes" --build-sha tracesmoke \
-        --artifact trace-smoke --output "$OUT/auxin-manifest.json" > /dev/null 2>&1
-    if [ ! -f "$OUT/auxin-manifest.json" ]; then
-      echo "  SKIP  ax-static could not produce a manifest for the target app. Coexistence UNTESTED."
-    else
+  echo "== 9b. RUN H: ALL FOUR TIERS IN ONE JVM, FROM ONE -javaagent =="
+  # This run used to install TWO agents. It is the run that found the VerifyError the merge had
+  # to fix, so it survives the merge as the run that proves the fix: coverage (tier-1), tier-2,
+  # the call-edge tier and the trace tier all instrument traceapp in one pass, from one emitter,
+  # in one fixed order -- and the class still verifies.
+  {
       port="$(free_port)"; rm -rf "$OUT/recv-both"; mkdir -p "$OUT/recv-both"
-      "$JAVA" -javaagent:"$AGENT" -javaagent:"$AXAGENT" \
+      rm -rf "$OUT/dump-four"
+      "$JAVA" -javaagent:"$AGENT" \
           -Dax.trace.enabled=true \
           -Dax.trace.include.packages=traceapp \
-          -Dax.trace.strip.conflict=disable-strip \
           -Dax.include.packages=traceapp \
-          -Dax.manifest="$OUT/auxin-manifest.json" \
+          -Dax.manifest="$MANIFEST" \
+          -Dax.tier2.enabled=true \
+          -Dax.edges.enabled=true -Dax.edges.sample.rate=1 \
           -Dax.transport.enabled=false \
+          -Dax.dump.dir="$OUT/dump-four" \
           -Dax.trace.collector.url="http://127.0.0.1:$port/v1/trace" \
           -Dtrace.smoke.scenario=full \
           -Dtrace.smoke.recv="$OUT/recv-both" \
           -Dtrace.smoke.port="$port" \
           -cp "$OUT/classes" tracerun.TraceApp > "$OUT/log-both.txt" 2>&1
       rc=$?
-      grep -E '^  (PASS|FAIL)|VerifyError|armed in|ARMED in' "$OUT/log-both.txt" | head -20 || true
-      tally "RUN H both agents" "$rc"
+      grep -E '^  (PASS|FAIL)|VerifyError|armed in|ARMED' "$OUT/log-both.txt" | head -20 || true
+      tally "RUN H all tiers" "$rc"
       if grep -qE 'VerifyError|ClassFormatError|NoClassDefFoundError' "$OUT/log-both.txt"; then
-        bad "RUN H: a verification or linkage error occurred with both agents installed"
+        bad "RUN H: a verification or linkage error occurred with all four tiers installed"
       else
-        ok "RUN H: no VerifyError / ClassFormatError / NoClassDefFoundError with both agents"
+        ok "RUN H: no VerifyError / ClassFormatError / NoClassDefFoundError with all four tiers"
       fi
-      check "RUN H: the tracer still produced 1 document alongside ax-agent" "1" \
+      check "RUN H: the trace tier still produced 1 document alongside coverage" "1" \
           "$(ls "$OUT/recv-both" 2>/dev/null | wc -l | tr -d ' ')"
       if [ -f "$OUT/recv-both/trace-1.json" ]; then
         python3 -c "
@@ -440,12 +494,11 @@ bs=[b for f in walk(d['frames']) for b in f.get('branches',[])]
 bad=[b for b in bs if b.get('op')=='IFNE' and b.get('why') in ('call','staticField','field') and b.get('n',1)>200]
 print('  coexistence: %d branch groups recorded, %d suspicious' % (len(bs), len(bad)))
 sys.exit(1 if bad else 0)" && \
-        ok "RUN H: ax-agent's own read-then-store probe (BALOAD+IFNE) was NOT recorded as a branch" || \
+        ok "RUN H: tier-1's own read-then-store probe (BALOAD+IFNE) was NOT recorded as a branch" || \
         bad "RUN H: a coverage probe leaked into the branch arms"
       fi
-    fi
-  fi
-fi
+  }
+}
 
 echo
 echo "== 10. RUN I: parallelstream.window=false -> the trap is explicitly unhandled =="
@@ -606,8 +659,194 @@ fi
 
 echo
 echo "=================================================================="
+echo "== SCOPE-v3.1: THE CLAIMS THE MERGE ADDED (new assertions) =="
+echo "=================================================================="
+
+echo
+echo "== 13. TRACE IS OFF BY DEFAULT, with the coverage side fully armed =="
+# RUN A already proves an inert tracer with no coverage. This proves the thing an operator
+# upgrading to the merged jar actually gets: coverage, tier-2 and edges all on, one -javaagent,
+# and NOT ONE trace instruction anywhere -- no ax.trace.* property set at all.
+rm -rf "$OUT/dump-default"
+port="$(free_port)"
+"$JAVA" -javaagent:"$AGENT" \
+    -Dax.include.packages=traceapp:stripcheck \
+    -Dax.manifest="$MANIFEST" \
+    -Dax.transport.enabled=false \
+    -Dax.dump.dir="$OUT/dump-default" \
+    -Dtrace.smoke.scenario=inert \
+    -Dtrace.smoke.recv="$OUT/recv-default" \
+    -Dtrace.smoke.port="$port" \
+    -cp "$OUT/classes" tracerun.TraceApp > "$OUT/log-default.txt" 2>&1
+rc=$?
+newchecks=$((newchecks+1)); tally "DEFAULT: the app ran with coverage on and tracing unset" "$rc"
+if grep -q 'per-request tracer is OFF (ax.trace.enabled=false, the default)' "$OUT/log-default.txt"; then
+  nok "DEFAULT: the startup line says the trace tier is off, and names the switch"
+else nbad "DEFAULT: expected the tracer-is-off startup line"; fi
+if grep -qE 'armed in [0-9]+ms' "$OUT/log-default.txt"; then
+  nok "DEFAULT: the coverage side armed anyway (one jar, independent tiers)"
+else nbad "DEFAULT: coverage should still arm with tracing off"; fi
+DEFCLS="$OUT/dump-default/traceapp.SearchService.class"
+if [ -f "$DEFCLS" ]; then
+  if "$JAVAP" -v -p -c "$DEFCLS" | grep -q 'io/auxin/trace'; then
+    nbad "DEFAULT: the instrumented class references io/auxin/trace with tracing off"
+  else
+    nok "DEFAULT: not one io/auxin/trace reference in the shipped bytecode with tracing off"
+  fi
+  ncheck "DEFAULT: tier-1 probes ARE installed (so this is a real comparison, not an empty one)" \
+      "1" "$([ "$("$JAVAP" -v -p -c "$DEFCLS" | grep -cE '^ +[0-9]+: baload' || true)" -gt 0 ] && echo 1 || echo 0)"
+else
+  nbad "DEFAULT: no class was dumped, so the off-by-default claim was not actually checked"
+  nbad "DEFAULT: tier-1 probe check not reached"
+fi
+
+echo
+echo "== 14. RUN K: THE SCOPED STRIP -- traced classes keep probes, others still strip =="
+port="$(free_port)"; rm -rf "$OUT/recv-strip"; mkdir -p "$OUT/recv-strip"
+"$JAVA" -javaagent:"$AGENT" \
+    -Dax.trace.enabled=true \
+    -Dax.trace.include.packages=traceapp \
+    -Dax.include.packages=traceapp:stripcheck \
+    -Dax.manifest="$MANIFEST" \
+    -Dax.collector.url="http://127.0.0.1:$port/v1/ingest" \
+    -Dax.flush.interval.ms=600000 \
+    -Dax.trace.collector.url="http://127.0.0.1:$port/v1/trace" \
+    -Dax.trace.projection="$MODULE/smoke/auxin-trace-projection.properties" \
+    -Dtrace.smoke.scenario=stripscope \
+    -Dtrace.smoke.recv="$OUT/recv-strip" \
+    -Dtrace.smoke.port="$port" \
+    -cp "$OUT/classes" tracerun.TraceApp > "$OUT/log-strip.txt" 2>&1
+rc=$?
+grep -E '^  (PASS|FAIL)' "$OUT/log-strip.txt" || true
+newchecks=$((newchecks+1)); tally "RUN K scoped strip (in-JVM assertions)" "$rc"
+if grep -q 'TIER-1b AUTO-STRIP IS DISABLED FOR traceapp and for nothing else' "$OUT/log-strip.txt"; then
+  nok "RUN K: the premain WARN names the affected scope, and says it is the ONLY one"
+else nbad "RUN K: the premain WARN must name the affected scope and no more"; fi
+if grep -q 'stripNow(traceapp.SearchService) REFUSED' "$OUT/log-strip.txt"; then
+  nok "RUN K: refusing to de-instrument a traced class is said out loud, not just counted"
+else nbad "RUN K: the refusal must be said out loud"; fi
+
+INGEST="$OUT/recv-strip/ingest-1.json"
+if [ -f "$INGEST" ]; then
+  python3 - "$INGEST" <<'PY2'
+import json, sys
+h = json.load(open(sys.argv[1]))["agentHealth"]
+out = []
+out.append(("tier1bDisabledByTrace is true on the wire", h.get("tier1bDisabledByTrace") is True,
+            repr(h.get("tier1bDisabledByTrace"))))
+out.append(("tier1bTraceBlockedClasses counts the classes Tier-1b declined",
+            isinstance(h.get("tier1bTraceBlockedClasses"), int)
+            and h["tier1bTraceBlockedClasses"] >= 1,
+            repr(h.get("tier1bTraceBlockedClasses"))))
+out.append(("tier1bTraceScope names WHY, so a UI need not guess",
+            h.get("tier1bTraceScope") == "traceapp", repr(h.get("tier1bTraceScope"))))
+# The whole point: classesStripped must NOT be read as "overhead is now zero", and the two
+# fields that say so travel together in the same block.
+out.append(("classesStripped ships next to it, so the pair can be read together",
+            "classesStripped" in h, "missing"))
+bad = 0
+for what, cond, detail in out:
+    if cond:
+        print("  PASS  RUN K: " + what)
+    else:
+        print("  FAIL  RUN K: " + what + " (" + detail + ")")
+        bad += 1
+sys.exit(1 if bad else 0)
+PY2
+  rc2=$?
+  newchecks=$((newchecks+4)); checks=$((checks+4))
+  [ "$rc2" = "0" ] || fails=$((fails+4))
+else
+  nbad "RUN K: no agentHealth window reached /v1/ingest, so the wire fields were not checked"
+fi
+
+echo
+echo "== 15. THE FOUR-TIER BYTECODE SHAPE (tier-1 + tier-2 + edges + trace, one method) =="
+# THE MOST LIKELY PLACE THE MERGE BREAKS. Four handler ranges and four frame contributions in
+# one method; the trace tier is emitted LAST and is therefore outermost, so the edge root's
+# handler block now sits INSIDE the trace range -- which is exactly why emitEdgeRoot had to stop
+# declaring zero locals. The JVM verified these classes at load (RUN H would have failed
+# otherwise); this section asserts the SHAPE, so a regression is a failed assertion rather than
+# a VerifyError nobody triggers.
+FOUR="$OUT/dump-four/traceapp.SearchService.class"
+FOURF="$OUT/dump-four/traceapp.SearchFilter.class"
+if [ ! -f "$FOUR" ]; then
+  nbad "four-tier shape: no class was dumped from the all-tiers run"
+else
+  fcount() { "$JAVAP" -v -p -c "$1" | grep -cE "$2" || true; }
+  # ONE METHOD, not one class file. handle(String,int) is the tier-2 boundary named in the
+  # manifest above, so it is also an edge ROOT (the shape that carries a handler), it is in
+  # ax.include.packages so it carries a tier-1 probe, and it is in
+  # ax.trace.include.packages so it carries a trace frame and a trace handler. Reading the four
+  # counts out of the whole class file would let a three-tier method pass.
+  mcount() { "$JAVAP" -v -p -c "$1" \
+      | awk '/public int handle\(java.lang.String, int\)/,/^$/' | grep -cE "$2" || true; }
+  M1="$(mcount "$FOUR" '^ +[0-9]+: baload')"
+  M2="$(mcount "$FOUR" 'Tier2Runtime\.enter')"
+  ME="$(mcount "$FOUR" 'EdgeRuntime\.rootEnter')"
+  MT="$(mcount "$FOUR" 'TraceRuntime\.enter')"
+  if [ "$M1" -gt 0 ] && [ "$M2" -gt 0 ] && [ "$ME" -gt 0 ] && [ "$MT" -gt 0 ]; then
+    nok "four-tier shape: SearchService#handle carries tier-1, tier-2, an edge ROOT and trace, all four at once"
+  else
+    nbad "four-tier shape: SearchService#handle must carry all four (t1=$M1 t2=$M2 edgeRoot=$ME trace=$MT)"
+  fi
+  # THREE nested catch(Throwable) handlers in that one method -- tier-2 innermost, then the edge
+  # root, then trace outermost -- and therefore three handler frames whose locals have to agree.
+  MANY="$("$JAVAP" -v -p -c "$FOUR" \
+      | awk '/public int handle\(java.lang.String, int\)/,/^$/' \
+      | grep -cE '^ +[0-9]+ +[0-9]+ +[0-9]+ +any$' || true)"
+  ncheck "four-tier shape: SearchService#handle carries exactly 3 nested catch(Throwable) ranges" \
+      "3" "$MANY"
+  # NOT ONE handler frame may erase locals[0] to top. This is the merge's central hazard, stated
+  # as a single number: `top` is assignable-TO and not assignable-FROM, so a zero-locals frame
+  # only composes if you are the last emitter -- and with four tiers, three of them are not.
+  ncheck "four-tier shape: NO handler frame declares zero locals (the VerifyError's signature)" \
+      "0" "$(fcount "$FOUR" 'locals = \[\]')"
+  if [ "$(fcount "$FOUR" 'locals = \[ class traceapp/SearchService')" -ge 1 ]; then
+    nok "four-tier shape: handler frames name the receiver, so a later range can merge with them"
+  else
+    nbad "four-tier shape: handler frames must name the receiver type"
+  fi
+  # The entry method is the one that carries the trace gate, and the one the original VerifyError
+  # named. It must carry the edge/tier-2/trace handlers AND still name its receiver.
+  if [ -f "$FOURF" ]; then
+    ncheck "four-tier shape: the servlet entry has no zero-locals frame either" \
+        "0" "$(fcount "$FOURF" 'locals = \[\]')"
+    if [ "$(fcount "$FOURF" 'TraceGate\.end:')" -ge 2 ]; then
+      nok "four-tier shape: TraceGate.end still runs on the normal path AND from the handler"
+    else
+      nbad "four-tier shape: TraceGate.end must run on both paths with all four tiers installed"
+    fi
+  else
+    nbad "four-tier shape: the servlet entry was not dumped"
+    nbad "four-tier shape: TraceGate.end not checked"
+  fi
+  # Emission order, read off the bytecode rather than trusted: the trace tier is outermost, so
+  # its exception-table entry is the LAST one and its range is the widest.
+  LASTRANGE="$("$JAVAP" -v -p -c "$FOUR" | grep -E '^ +[0-9]+ +[0-9]+ +[0-9]+ +any$' | tail -1)"
+  if [ -n "$LASTRANGE" ]; then
+    nok "four-tier shape: the exception table carries the nested ranges (last: $(echo $LASTRANGE))"
+  else
+    nbad "four-tier shape: expected exception-table entries for the handler ranges"
+  fi
+fi
+
+echo
+echo "=================================================================="
+MIGRATED=$((checks - newchecks))
+# "Nothing was lost in the merge" is checked, not claimed: the migrated suite was 53 assertions
+# when it ran against a separate -javaagent, and it must still be 53 here.
+if [ "$MIGRATED" = "53" ]; then
+  echo "MIGRATED SUITE: $MIGRATED assertions (was 53 against the separate ax-trace.jar)"
+else
+  echo "MIGRATED SUITE: $MIGRATED assertions -- EXPECTED 53. An assertion was lost or added"
+  echo "                outside the SCOPE-v3.1 section. That is the thing this count exists to"
+  echo "                catch, so it is a failure."
+  fails=$((fails+1))
+fi
+echo "SCOPE-v3.1 ADDITIONS: $newchecks assertions"
 if [ "$fails" -gt 0 ]; then
   echo "TRACE SMOKE FAILED: $fails/$checks assertions"
   exit 1
 fi
-echo "TRACE SMOKE PASSED: $checks/$checks assertions"
+echo "TRACE SMOKE PASSED: $checks/$checks assertions ($MIGRATED migrated + $newchecks new)"

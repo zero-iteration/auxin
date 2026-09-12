@@ -150,6 +150,23 @@ public final class WindowPayload {
      * this window is unaffected, so this is deliberately not {@code degraded}.
      */
     public long stripMaskMissing;
+
+    /**
+     * SCOPE-v3.1: Tier-1b's auto-strip is suppressed for the intersection of the traced and
+     * instrumented scopes, so {@code classesStripped} is NOT a statement that steady-state
+     * overhead reached zero on this JVM.
+     *
+     * <p>Additive, so a v2 reader ignores it — but a reader that renders "overhead is now zero"
+     * from {@code classesStripped} alone is wrong whenever this is true, which is the entire
+     * reason it ships.
+     */
+    public boolean tier1bDisabledByTrace;
+
+    /** The scope intersection responsible, dotted, e.g. {@code com.acme.search}. */
+    public String tier1bTraceScope = "";
+
+    /** Distinct classes Tier-1b declined to strip for that reason. */
+    public long tier1bTraceBlockedClasses;
     /**
      * {@code ax.include.packages} is set and not one class has been instrumented (G5-BUG-1).
      * "I was configured to do work and did none" is not a clean run, and a window carrying this

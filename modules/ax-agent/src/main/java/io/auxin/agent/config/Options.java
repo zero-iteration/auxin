@@ -1,6 +1,7 @@
 package io.auxin.agent.config;
 
 import io.auxin.agent.util.Log;
+import io.auxin.trace.config.TraceOptions;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -17,7 +18,12 @@ import java.util.Map;
  * System properties may use either separator.
  *
  * <p>Three-level kill switch (PLAN-v2): {@link #enabled} (agent), {@link #tier1Enabled} /
- * {@link #tier2Enabled} (tier), {@link Scope} exclude list (package).
+ * {@link #tier2Enabled} / {@link #edgesEnabled} / {@code trace.enabled} (tier), {@link Scope}
+ * exclude list (package).
+ *
+ * <p>SCOPE-v3.1 folded the per-request tracer in as one more tier, so its keys are parsed here
+ * too, from the same argument map, under the {@code trace.} prefix (agent argument) and the
+ * {@code ax.trace.*} namespace (system property). See {@link #trace}.
  */
 public final class Options {
 
@@ -180,6 +186,15 @@ public final class Options {
     public final String dumpDir;
     public final int logLevel;
 
+    /**
+     * The per-request trace tier (SCOPE-v3.1). <b>Off by default</b> and parsed from the same
+     * argument map: one premain, one jar, one {@code -javaagent}.
+     *
+     * <p>It is never null; {@code trace.enabled} is the master switch and every other trace key
+     * is inert while it is false.
+     */
+    public final TraceOptions trace;
+
     private Options(Map<String, String> a) {
         this.logLevel = Log.parseLevel(a.get("log.level"), Log.INFO);
         Log.setLevel(this.logLevel);
@@ -288,7 +303,14 @@ public final class Options {
         this.clockDisabledThresholdNs = disabledNs;
 
         this.dumpDir = str(a, "dump.dir", "");
+
+        // LAST: the trace tier reads ax.environment and the agent's log level, both settled
+        // above, and its own keys out of the same map under a `trace.` prefix.
+        this.trace = TraceOptions.parse(a, this.logLevel);
     }
+
+    /** Is the per-request trace tier switched on for this JVM? Level one AND level two. */
+    public boolean traceEnabled() { return enabled && trace.enabled; }
 
     public static Options parse(String agentArgs) {
         Map<String, String> a = new LinkedHashMap<String, String>();
@@ -435,6 +457,11 @@ public final class Options {
                 + " environment=" + (environment.isEmpty() ? "<unset>" : environment)
                 + " collector=" + (collectorUrl.isEmpty() ? "<none>" : collectorUrl)
                 + " flushMs=" + flushIntervalMs
-                + " ring=" + ringCapacity;
+                + " ring=" + ringCapacity
+                // The trace tier is one field on the line an operator actually reads when it is
+                // off, and its whole summary when it is on -- because when it is on, a property
+                // ax-agent promised no longer holds (docs/TRADE-OFFS.md section 2).
+                + " trace=" + trace.enabled
+                + (trace.enabled ? " [" + trace.summary() + "]" : "");
     }
 }
