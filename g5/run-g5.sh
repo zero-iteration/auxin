@@ -156,16 +156,84 @@ if [ ! -d "$OUT/demo11/classes" ] || [ -n "${FORCE_DEMO11:-}" ]; then
 fi
 say "  demo (rel 11) out/demo11/classes  (class-file 55, for the JDK 11 runs)"
 
-# ---- manifests (stand-in for ax-static; ManifestTool ships inside the agent jar) ---------
-"$JDK17/bin/java" -cp "$AX_SHIPPED" \
-    io.auxin.agent.manifest.ManifestTool \
-    "$DEMO/target/classes" "$OUT/demo-manifest.json" \
-    --artifact=auxin-demo --buildSha=g5demo >/dev/null || exit 3
-"$JDK17/bin/java" -cp "$AX_SHIPPED" \
-    io.auxin.agent.manifest.ManifestTool \
-    "$OUT/demo11/classes" "$OUT/demo11-manifest.json" \
-    --artifact=auxin-demo --buildSha=g5demo >/dev/null || exit 3
-say "  manifests     demo-manifest.json + demo11-manifest.json"
+# ---- manifests, from the REAL ax-static -------------------------------------------------
+# Until now this step ran io.auxin.agent.manifest.ManifestTool, a class that shipped inside the
+# agent jar and described itself as a "temporary stand-in for ax-static". So this matrix -- three
+# agents, three JDKs, real traffic -- had never once exercised the manifest the build system will
+# actually hand the agent. ManifestTool is deleted; ax-static is the only generator.
+AXSTATIC="$ROOT/modules/ax-static/target/ax-static.jar"
+if [ ! -f "$AXSTATIC" ]; then
+  say "  FATAL: the manifest generator is not built: $AXSTATIC"
+  say "         build it with:"
+  say "             (cd $ROOT/modules/ax-static && mvn -q clean package)"
+  say "         There is no fallback generator: a manifest produced by anything other than"
+  say "         ax-static would make this matrix a test of something that does not ship."
+  exit 3
+fi
+# ax-static is compiled for release 17 and CANNOT run on JDK 11, which this matrix also targets.
+# It is a build-time tool whose only output is JSON, so the JDK that generates the manifest is
+# independent of the JVM under test -- hence $JDK17 here even for the JDK 11 configs below.
+if [ ! -x "$JDK17/bin/java" ]; then
+  say "  FATAL: ax-static needs a JDK 17+ to run; $JDK17/bin/java is not executable."
+  say "         Set JDK17=/path/to/jdk17 (it is only used to RUN the generator)."
+  exit 3
+fi
+# No --tier2 patterns: the old invocation passed none either, so the explicit half of the
+# selection stays empty and the translation is exact. What is NOT the same is the AUTOMATIC half
+# -- ax-static times every detected entry point, so the demo's 3 com.sun.net.httpserver
+# HttpHandler implementations and App.main are now tier-2. That is the production default and it
+# is what should be under test; it is asserted below rather than assumed.
+"$JDK17/bin/java" -jar "$AXSTATIC" \
+    --input "$DEMO/target/classes" \
+    --build-sha g5demo --artifact auxin-demo \
+    --output "$OUT/demo-manifest.json" >"$OUT/ax-static-demo.log" 2>&1 || {
+      say "  FATAL: ax-static failed on $DEMO/target/classes (see $OUT/ax-static-demo.log)"
+      sed 's/^/         /' "$OUT/ax-static-demo.log"; exit 3; }
+"$JDK17/bin/java" -jar "$AXSTATIC" \
+    --input "$OUT/demo11/classes" \
+    --build-sha g5demo --artifact auxin-demo \
+    --output "$OUT/demo11-manifest.json" >"$OUT/ax-static-demo11.log" 2>&1 || {
+      say "  FATAL: ax-static failed on $OUT/demo11/classes (see $OUT/ax-static-demo11.log)"
+      sed 's/^/         /' "$OUT/ax-static-demo11.log"; exit 3; }
+say "  manifests     demo-manifest.json + demo11-manifest.json  (ax-static, run on JDK 17)"
+# The release-11 rebuild must yield the SAME probe layout as the release-17 jar, or the fixture's
+# ground truth transfers only approximately. Asserted, not assumed -- and now across a generator
+# change, which is exactly when a probe-index shift would slip through unnoticed (A14).
+python3 - "$OUT/demo-manifest.json" "$OUT/demo11-manifest.json" <<'PY' || exit 3
+import json, sys
+def layout(p):
+    d = json.load(open(p))
+    return {c["name"]: (c["probeCount"], c["schemaHash"],
+                        tuple((m["idx"], m["name"], m["desc"], m["tier2"]) for m in c["methods"]))
+            for c in d["classes"]}
+a, b = layout(sys.argv[1]), layout(sys.argv[2])
+if a != b:
+    print("  FATAL: release-11 and release-17 manifests disagree")
+    for k in sorted(set(a) | set(b)):
+        if a.get(k) != b.get(k):
+            print("         %s" % k)
+    sys.exit(3)
+t2 = sorted(c["name"] + "#" + m["name"] + m["desc"] + "  " + m.get("tier2Reason", "")
+            for c in json.load(open(sys.argv[1]))["classes"]
+            for m in c["methods"] if m["tier2"])
+expected = [
+    "io.auxin.demo.App#main([Ljava/lang/String;)V  entryPoint:main",
+    "io.auxin.demo.http.handler.AdminHandler#handle(Lcom/sun/net/httpserver/HttpExchange;)V"
+    "  entryPoint:HttpHandler",
+    "io.auxin.demo.http.handler.HealthHandler#handle(Lcom/sun/net/httpserver/HttpExchange;)V"
+    "  entryPoint:HttpHandler",
+    "io.auxin.demo.http.handler.OrderHandler#handle(Lcom/sun/net/httpserver/HttpExchange;)V"
+    "  entryPoint:HttpHandler",
+]
+print("  tier-2        %d auto-selected entry points (no --tier2 pattern was passed):" % len(t2))
+for k in t2:
+    print("                  " + k)
+if t2 != sorted(expected):
+    print("  FATAL: tier-2 auto-selection is not what this matrix was calibrated against")
+    print("         missing: %s" % sorted(set(expected) - set(t2)))
+    print("         extra  : %s" % sorted(set(t2) - set(expected)))
+    sys.exit(3)
+PY
 
 # =============================================================================
 # 2. one run

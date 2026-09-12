@@ -4,6 +4,7 @@ from ax_server.collector.buckets import BUCKET_SCHEME, bucket_bounds, bucket_ind
 from ax_server.collector.classification import Classification, EnvironmentPolicy
 from ax_server.collector.errors import IngestRejected, RejectReason
 from ax_server.collector.health import IngestHealth
+from ax_server.collector.known_methods import UNCHECKED, KnownMethods, MethodIndex
 from ax_server.collector.service import CollectorService, IngestResult
 from ax_server.collector.testrunner import TestRunnerDetector
 
@@ -15,7 +16,10 @@ __all__ = [
     "IngestHealth",
     "IngestRejected",
     "IngestResult",
+    "KnownMethods",
+    "MethodIndex",
     "RejectReason",
+    "UNCHECKED",
     "TestRunnerDetector",
     "bucket_bounds",
     "bucket_index",

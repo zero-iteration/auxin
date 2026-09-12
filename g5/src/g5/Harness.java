@@ -48,7 +48,6 @@ public final class Harness {
     private static final String JACOCO_RT = "org.jacoco.agent.rt.RT";
 
     private static final String CUSTOMER = "io.auxin.demo.model.Customer";
-    private static final String CUSTOMER_NAME_DESC = "()Ljava/lang/String;";
     private static final String CUSTOMER_ANON_DESC = "()Lio/auxin/demo/model/Customer;";
 
     /** Distinctive path so the OTel span log can be asked "did you see traffic after all that?". */
@@ -135,22 +134,49 @@ public final class Harness {
         Method stripNow = m(AGENT, "stripNow", Class.class);
 
         // ------------------------------------------------------------------
-        // Part A — behavioural proof, on a class with two never-invoked methods
+        // Part A — behavioural proof, on a method that really does carry a probe
         // ------------------------------------------------------------------
+        // The subject used to be Customer.name(). Under the REAL ax-static manifest that method
+        // carries NO PROBE AT ALL: its body is `aload_0; getfield; areturn`, a plain field
+        // accessor, which ax-static marks dynamicallyObservable=false, and ProbeEmitter skips
+        // such a method before emitting anything (C51). So `p[idxName]` could never be set, and
+        // "the probe no longer fires after the strip" was true whether or not the strip removed
+        // a single instruction -- G5-BUG-3's reproduction and T1B.probeGoneAfterStrip would both
+        // have passed vacuously. The in-agent stand-in generator marked those getters observable,
+        // which is the only reason this held together before.
+        //
+        // anonymize() is the subject now: non-trivial, so genuinely probed, and DEAD in the
+        // fixture's ground truth, so its bit starts clear. The probe's existence is PROVEN below
+        // rather than assumed, because that is the assumption that just broke.
         Class<?> customer = Class.forName(CUSTOMER);
-        int idxName = ((Integer) probeIndex.invoke(null, CUSTOMER, "name", CUSTOMER_NAME_DESC)).intValue();
         int idxAnon = ((Integer) probeIndex.invoke(null, CUSTOMER, "anonymize", CUSTOMER_ANON_DESC)).intValue();
-        r.put("customerProbeIdx.name", Integer.valueOf(idxName));
         r.put("customerProbeIdx.anonymize", Integer.valueOf(idxAnon));
 
         boolean[] p = (boolean[]) probes.invoke(null, CUSTOMER);
         r.put("customerInstrumented", Boolean.valueOf(p != null));
-        if (p == null || idxName < 0 || idxAnon < 0) {
+        if (p == null || idxAnon < 0) {
             r.put("skipped", "Customer was not instrumented (see classesSkipped in the window)");
             return;
         }
-        r.put("A0.name.before", Boolean.valueOf(p[idxName]));
         r.put("A0.anonymize.before", Boolean.valueOf(p[idxAnon]));
+        Constructor<?> ctor = customer.getConstructor(String.class, String.class, String.class);
+
+        // PROVE the subject is probed, by invoking it once before the strip and watching the bit
+        // flip. Then clear the bit by hand -- an already-set probe cannot tell a stripped method
+        // from an un-stripped one, which is the same reason SmokeApp clears spin()'s bit. If the
+        // bit does not flip, Part A is measuring nothing and this is a hard error rather than a
+        // silent pass (check.py gates on `error` via T1B.noError).
+        Object warm = ctor.newInstance("c-warm", "Ada", "std");
+        customer.getMethod("anonymize").invoke(warm);
+        p = (boolean[]) probes.invoke(null, CUSTOMER);
+        r.put("A0.anonymize.probeInstalled", Boolean.valueOf(p[idxAnon]));
+        if (!p[idxAnon]) {
+            r.put("error", "Customer.anonymize() carries no probe (idx " + idxAnon + "), so every "
+                    + "Part A assertion would pass vacuously. Check the manifest's "
+                    + "dynamicallyObservable flag for it.");
+            return;
+        }
+        p[idxAnon] = false;
         // -parameters is on for the demo build. Any retransform replays the JVM's CACHED class
         // bytes, and on some JDKs those do not carry MethodParameters -- so a live class can
         // lose its parameter names the moment any agent retransforms it. Measure, do not infer.
@@ -166,13 +192,14 @@ public final class Harness {
 
         // The class must still work, and the probe must no longer fire.
         phase("post-strip-call");
-        Constructor<?> ctor = customer.getConstructor(String.class, String.class, String.class);
         Object c1 = ctor.newInstance("c-strip", "Ada", "vip");
-        Object nameValue = customer.getMethod("name").invoke(c1);
+        Object anonAfterStrip = customer.getMethod("anonymize").invoke(c1);
         p = (boolean[]) probes.invoke(null, CUSTOMER);
-        r.put("A2.name.callable", Boolean.valueOf("Ada".equals(nameValue)));
-        r.put("A2.name.probeAfterCall", Boolean.valueOf(p[idxName]));
-        r.put("A2.stripEffective", Boolean.valueOf(!p[idxName]));
+        r.put("A2.anonymize.callable", Boolean.valueOf(anonAfterStrip != null
+                && "REDACTED".equals(customer.getMethod("name").invoke(anonAfterStrip))
+                && "c-strip".equals(customer.getMethod("id").invoke(anonAfterStrip))));
+        r.put("A2.anonymize.probeAfterCall", Boolean.valueOf(p[idxAnon]));
+        r.put("A2.stripEffective", Boolean.valueOf(!p[idxAnon]));
         r.put("A3.parameterNamesPresentAfterStrip",
                 Boolean.valueOf(parameterNamesPresent(customer)));
 
@@ -189,6 +216,11 @@ public final class Harness {
 
         if (retransformed) {
             phase("post-thirdparty-call");
+            // A2's call may or may not have set this bit -- whether it did IS G5-BUG-3. Clear it
+            // so "did the probe come back?" is measured from a known state in both -javaagent
+            // orderings rather than inheriting A2's outcome.
+            p = (boolean[]) probes.invoke(null, CUSTOMER);
+            p[idxAnon] = false;
             Object c2 = ctor.newInstance("c-reappear", "Grace", "std");
             Object anon = customer.getMethod("anonymize").invoke(c2);
             p = (boolean[]) probes.invoke(null, CUSTOMER);
@@ -205,10 +237,14 @@ public final class Harness {
             r.put("B6.parameterNamesPresentAfterForeignRetransform",
                     Boolean.valueOf(parameterNamesPresent(customer)));
 
-            Object c3 = ctor.newInstance("c-check", "Hopper", "std");
-            customer.getMethod("name").invoke(c3);
+            // Same again after the drain cycles above: clear, call, look. name() is not usable
+            // here -- it is a plain field accessor and carries no probe under a real manifest.
             p = (boolean[]) probes.invoke(null, CUSTOMER);
-            r.put("B5.name.probeAfterWaitAndCall", Boolean.valueOf(p[idxName]));
+            p[idxAnon] = false;
+            Object c3 = ctor.newInstance("c-check", "Hopper", "std");
+            customer.getMethod("anonymize").invoke(c3);
+            p = (boolean[]) probes.invoke(null, CUSTOMER);
+            r.put("B5.anonymize.probeAfterWaitAndCall", Boolean.valueOf(p[idxAnon]));
         }
 
         // ------------------------------------------------------------------

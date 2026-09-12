@@ -1,6 +1,7 @@
 package dev.auxin.staticscan.entry;
 
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
 
@@ -40,6 +41,10 @@ public final class EntryPointCatalog {
             "Ljavax/ws/rs/Path;",
             "Ljakarta/ws/rs/Path;");
 
+    // Declared after CLASS_LEVEL_DESCRIPTORS on purpose: it is derived from it, and a static
+    // initialiser reads the fields above it, not below.
+    private static final Set<String> CLASS_LEVEL_KINDS = classLevelKinds();
+
     /** The {@code kind} for this annotation descriptor, or {@code null} if it marks nothing. */
     public String kindOf(String annotationDescriptor) {
         return KIND_BY_DESCRIPTOR.get(annotationDescriptor);
@@ -48,6 +53,31 @@ public final class EntryPointCatalog {
     /** Whether this annotation, found on a class, marks that class's methods as entry points. */
     public boolean appliesAtClassLevel(String annotationDescriptor) {
         return CLASS_LEVEL_DESCRIPTORS.contains(annotationDescriptor);
+    }
+
+    /**
+     * Whether a method could have acquired this {@code kind} by propagation from its type rather
+     * than by carrying the annotation itself.
+     *
+     * <p>Exists so that a consumer choosing <em>one</em> kind to report for a method that has
+     * several can prefer the one actually written on it. A {@code @Scheduled} method inside a
+     * {@code @RequestMapping} class produces both kinds, and calling it an HTTP endpoint would be
+     * the less true of the two answers.
+     */
+    public boolean isPropagatedFromType(String kind) {
+        return CLASS_LEVEL_KINDS.contains(kind);
+    }
+
+    /** Derived from {@link #CLASS_LEVEL_DESCRIPTORS} so the two can never disagree. */
+    private static Set<String> classLevelKinds() {
+        Set<String> kinds = new LinkedHashSet<>();
+        for (String descriptor : CLASS_LEVEL_DESCRIPTORS) {
+            String kind = KIND_BY_DESCRIPTOR.get(descriptor);
+            if (kind != null) {
+                kinds.add(kind);
+            }
+        }
+        return Set.copyOf(kinds);
     }
 
     private static Map<String, String> kindByDescriptor() {

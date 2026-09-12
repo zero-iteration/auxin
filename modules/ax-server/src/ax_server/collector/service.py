@@ -14,11 +14,18 @@ from ax_server.collector.classification import EnvironmentPolicy
 from ax_server.collector.decode import decode_window
 from ax_server.collector.errors import IngestRejected, RejectReason
 from ax_server.collector.health import IngestHealth
+from ax_server.collector.known_methods import UNCHECKED, KnownMethods
 from ax_server.collector.testrunner import TestRunnerDetector
-from ax_server.store.bitset import newly_set
+from ax_server.store.bitset import and_not, newly_set, popcount
 from ax_server.store.errors import SchemaMismatch
 from ax_server.store.models import IngestWindow
-from ax_server.store.port import IngestAudit, Store, WindowAttribution
+from ax_server.store.port import (
+    EdgeStore,
+    IngestAudit,
+    ProbeInstallStore,
+    Store,
+    WindowAttribution,
+)
 
 __all__ = ["CollectorService", "IngestResult", "MAX_BODY_BYTES"]
 
@@ -41,6 +48,27 @@ class IngestResult:
     discarded_test_records: int
     degraded: bool
     tier2_percentiles: Mapping[str, Mapping[str, int | None]]
+    #: SCOPE-v3. `edge_sampled_observations` is a sum of RAW observations in
+    #: sampled traces, NOT a call total: divide nothing, multiply by
+    #: `edges_sample_rate` for an estimate, and never quote it as exact.
+    edges_merged: int = 0
+    edge_sampled_observations: int = 0
+    edges_sample_rate: int | None = None
+    edges_enabled: bool = False
+    edges_reported: bool = False
+    edge_endpoints_verified: bool = False
+    #: Bug #18. `install_masks_merged` counts coverage records whose
+    #: `probesInstalled` mask was OR-merged; `records_without_install_mask`
+    #: counts records from a pre-#18 agent that carried none. An absent mask
+    #: is NOT an all-zero one, so the two are never added together.
+    install_masks_merged: int = 0
+    records_without_install_mask: int = 0
+    install_mask_inconsistencies: int = 0
+    #: Masks that were reported but NOT stored -- the adapter has no
+    #: `ProbeInstallStore`, or it refused them. The #18 gate is not running
+    #: for those classes, which is a different fact from "no mask was sent".
+    install_masks_dropped: int = 0
+    strip_mask_missing: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -54,6 +82,28 @@ class IngestResult:
             "discardedTestRecords": self.discarded_test_records,
             "degraded": self.degraded,
             "tier2Percentiles": {k: dict(v) for k, v in self.tier2_percentiles.items()},
+            "edgesMerged": self.edges_merged,
+            "edgeSampledObservations": self.edge_sampled_observations,
+            "edgesSampleRate": self.edges_sample_rate,
+            "edgesEnabled": self.edges_enabled,
+            "edgesReported": self.edges_reported,
+            "edgeEndpointsVerified": self.edge_endpoints_verified,
+            "edgeCountNote": (
+                "edgeSampledObservations counts observations in SAMPLED traces, not "
+                "calls; multiply by edgesSampleRate for an estimate and never present "
+                "it as exact (CONTRACTS 2 v3)"
+            ),
+            "installMasksMerged": self.install_masks_merged,
+            "recordsWithoutInstallMask": self.records_without_install_mask,
+            "installMaskInconsistencies": self.install_mask_inconsistencies,
+            "installMasksDropped": self.install_masks_dropped,
+            "stripMaskMissing": self.strip_mask_missing,
+            "installMaskNote": (
+                "probesInstalled is the set of indices a probe was ACTUALLY installed at. "
+                "probes => liveness; probesInstalled & ~probes => the only death "
+                "evidence; ~probesInstalled => silence, never evidence of anything "
+                "(bug #18)"
+            ),
         }
 
 
@@ -77,11 +127,15 @@ class CollectorService:
         health: IngestHealth | None = None,
         clock: Callable[[], datetime] = _utcnow,
         max_body_bytes: int = MAX_BODY_BYTES,
+        known_methods: KnownMethods = UNCHECKED,
     ) -> None:
         self.store = store
         self.policy = policy or EnvironmentPolicy()
         self.detector = detector or TestRunnerDetector()
         self.health = health or IngestHealth()
+        #: The manifest identity space `edges[]` endpoints are checked against.
+        #: Defaults to "cannot check", which is counted, never assumed away.
+        self.known_methods = known_methods
         self._clock = clock
         self._max_body = max_body_bytes
 
@@ -109,7 +163,11 @@ class CollectorService:
     def ingest(self, payload: Mapping[str, Any]) -> IngestResult:
         try:
             window, discarded = decode_window(
-                payload, policy=self.policy, detector=self.detector, health=self.health
+                payload,
+                policy=self.policy,
+                detector=self.detector,
+                health=self.health,
+                known=self.known_methods,
             )
         except IngestRejected as exc:
             self._log_and_count(exc, payload)
@@ -136,6 +194,17 @@ class CollectorService:
         mismatches: list[str] = []
         merged = 0
         fresh_bits = 0
+        # Bug #18 counters. Kept apart from `merged` because a record that
+        # carried no mask and one that reported an empty mask are different
+        # facts and an operator has to be able to tell them apart.
+        install_merged = 0
+        install_absent = 0
+        install_inconsistent = 0
+        #: masks the store cannot hold (no `ProbeInstallStore`) ...
+        install_unsupported = 0
+        #: ... as distinct from masks refused by the store. Two different
+        #: operator actions, so two counters and two log lines.
+        install_dropped = 0
         attribution = (
             self.store.attribute_to(when)
             if isinstance(self.store, WindowAttribution)
@@ -169,6 +238,127 @@ class CollectorService:
                 merged += 1
                 fresh_bits += len(newly_set(existing, record.probes))
 
+                # -- the installed-probe mask (bug #18) ------------------
+                # Merged immediately after the coverage OR and under the same
+                # window attribution: the two are indexed by the same
+                # build-time probe index and checked against the same schema
+                # hash, so storing one without the other would leave the gate
+                # and the evidence it gates out of step. Only reached when the
+                # coverage merge SUCCEEDED -- a class whose record was dropped
+                # for a schema mismatch contributes no mask either.
+                if record.probes_installed is None:
+                    # A pre-#18 agent. NOT normalised to an all-zero mask:
+                    # that would withdraw every index in the class from the
+                    # death argument on the strength of a producer's age.
+                    install_absent += 1
+                    continue
+                stray = popcount(and_not(record.probes, record.probes_installed))
+                if stray:
+                    # A probe that fired must have been installed, so the mask
+                    # is stale or wrong. Loud, and counted -- but not fatal:
+                    # the set bit is still good evidence of LIFE, and the mask
+                    # is only ever used to WITHHOLD death evidence.
+                    # `stripMaskMissing` is quoted in the same line because a
+                    # non-zero value is the LIKELY CAUSE: the agent could not
+                    # determine its mask and shipped an all-zero one, so an
+                    # already-set probe now looks "uninstalled". Making the
+                    # operator correlate two log lines to learn that is how a
+                    # benign counter gets chased as a data bug.
+                    log.warning(
+                        "INSTALL MASK INCONSISTENT build=%s class=%s instance=%s -- %d "
+                        "probe(s) are set at indices the mask says were never "
+                        "instrumented (agentHealth.stripMaskMissing=%d); the set bits "
+                        "remain valid evidence of life",
+                        window.build_sha, record.cls, window.instance_id, stray,
+                        window.agent_health.strip_mask_missing,
+                    )
+                    install_inconsistent += 1
+                    self.health.count_partial(
+                        RejectReason.PROBE_INSTALL_MASK_INCONSISTENT, record.cls
+                    )
+                if isinstance(self.store, ProbeInstallStore):
+                    try:
+                        self.store.merge_probes_installed(
+                            window.build_sha,
+                            record.cls,
+                            record.schema_hash,
+                            record.probes_installed,
+                        )
+                    except SchemaMismatch as exc:
+                        # Unreachable while the two tables are written
+                        # together, which they are -- but if they ever
+                        # diverge, DROP THE MASK, never the window. Losing a
+                        # mask costs candidates; failing the window costs the
+                        # liveness evidence that was already merged above.
+                        log.error(
+                            "INSTALL MASK SCHEMA MISMATCH build=%s class=%s stored=%s "
+                            "incoming=%s -- mask dropped, coverage kept",
+                            window.build_sha, record.cls, exc.expected, exc.actual,
+                        )
+                        install_dropped += 1
+                        self.health.count_partial(
+                            RejectReason.SCHEMA_HASH_MISMATCH, record.cls
+                        )
+                    else:
+                        install_merged += 1
+                else:
+                    install_unsupported += 1
+
+        if install_unsupported:
+            # Nothing is misattributed -- the analysis falls back to "no mask
+            # reported", which is the pre-#18 behaviour -- but the gate is not
+            # running, and that has to be visible rather than assumed away.
+            log.warning(
+                "store %s does not implement ProbeInstallStore; %d installed-probe "
+                "mask(s) DISCARDED for build=%s instance=%s -- the bug #18 gate is "
+                "NOT running for this build",
+                type(self.store).__name__, install_unsupported,
+                window.build_sha, window.instance_id,
+            )
+            self.health.count_partial(RejectReason.PROBE_INSTALL_MASK_DISCARDED)
+        if window.agent_health.strip_mask_missing:
+            log.warning(
+                "agent could not determine its installed-probe mask %d time(s) "
+                "build=%s instance=%s -- it shipped an ALL-ZERO probesInstalled, so "
+                "candidates are LOST rather than invented (bug #18)",
+                window.agent_health.strip_mask_missing,
+                window.build_sha, window.instance_id,
+            )
+
+        # -- the SCOPE-v3 edge tier ------------------------------------
+        # ADDITIVE, and deliberately not inside the coverage loop above: that
+        # loop performs an idempotent OR of an accumulated bitset, this adds a
+        # per-window delta. Two operations, two semantics, two code paths.
+        edges_merged = 0
+        edge_health = window.agent_health.edges
+        if isinstance(self.store, EdgeStore):
+            edges_merged = self.store.record_edges(window)
+        elif window.edges:
+            log.warning(
+                "store %s does not implement EdgeStore; %d edge record(s) DISCARDED "
+                "for build=%s instance=%s",
+                type(self.store).__name__, len(window.edges),
+                window.build_sha, window.instance_id,
+            )
+        edge_observations = sum(e.count for e in window.edges)
+        verified = self.known_methods.knows_build(window.build_sha)
+        if window.edges and not verified:
+            log.warning(
+                "edge endpoints NOT verified for build=%s (%s); a dangling (class, idx) "
+                "would not have been caught",
+                window.build_sha, self.known_methods.describe(),
+            )
+        if edge_health.lossy:
+            # Not `degraded`: CONTRACTS 2 is explicit that a latched-off edge
+            # tier leaves coverage and tier-2 in the same window valid.
+            log.info(
+                "edge tier lossy build=%s instance=%s dropped=%d truncated=%d "
+                "tierFailures=%d tracesReaped=%d -- absence of an edge is NOT evidence",
+                window.build_sha, window.instance_id, edge_health.dropped,
+                edge_health.truncated_total, edge_health.tier_failures,
+                edge_health.traces_reaped,
+            )
+
         if window.agent_health.degraded:
             log.warning(
                 "degraded window accepted build=%s instance=%s ringDropped=%d "
@@ -184,6 +374,15 @@ class CollectorService:
             probes_newly_set=fresh_bits,
             tier2_records=len(window.tier2),
             discarded_test_records=discarded,
+            edge_records=edges_merged,
+            edge_observations=edge_observations,
+            edges_reported=window.edges_present,
+            edges_enabled=edge_health.enabled,
+            edges_sample_rate=edge_health.sample_rate,
+            edges_verified=verified or not window.edges,
+            install_mask_records=install_merged,
+            records_without_install_mask=install_absent,
+            strip_mask_missing=window.agent_health.strip_mask_missing,
         )
 
         pcts = {
@@ -201,6 +400,17 @@ class CollectorService:
             discarded_test_records=discarded,
             degraded=window.agent_health.degraded,
             tier2_percentiles=pcts,
+            edges_merged=edges_merged,
+            edge_sampled_observations=edge_observations,
+            edges_sample_rate=edge_health.sample_rate or None,
+            edges_enabled=edge_health.enabled,
+            edges_reported=window.edges_present,
+            edge_endpoints_verified=verified,
+            install_masks_merged=install_merged,
+            records_without_install_mask=install_absent,
+            install_mask_inconsistencies=install_inconsistent,
+            install_masks_dropped=install_unsupported + install_dropped,
+            strip_mask_missing=window.agent_health.strip_mask_missing,
         )
 
     def _reject(

@@ -25,6 +25,27 @@ public final class WindowPayload {
         public String className;
         public String schemaHash;
         public String probesBase64;   // packed bitset, LSB = idx 0, ACCUMULATED (never reset)
+        /**
+         * The INSTALLED-PROBE MASK for the same indices, same packing: bit {@code i} is set iff
+         * the agent actually emitted a probe at index {@code i} in this JVM. Additive; always
+         * present, so an absent key and an all-zero mask are different facts.
+         *
+         * <p><b>Why a second bitset.</b> {@link #probesBase64} is sized to every probe-eligible
+         * method in the build manifest, but a probe is installed at only some of those indices.
+         * A slot with no probe is never written by anything, so a zero there means "no evidence",
+         * while a zero in a slot that DOES carry a probe means "this method did not run". Shipped
+         * as one bitset the two are indistinguishable, which makes a permanently-zero bit look
+         * like a dead method — the same class of error as gating the Tier-1b strip on it.
+         *
+         * <p>The C51 half of that was recoverable downstream by joining the build manifest's
+         * {@code dynamicallyObservable} flag, and the collector does exactly that. The rest is
+         * not: whether an entry stack map frame could be built safely, and whether
+         * {@code ax.tier1.enabled} was on, are facts about THIS JVM that no manifest can carry.
+         * So: {@code probes} is the liveness evidence, {@code probesInstalled & ~probes} is the
+         * only set of indices this window may be read as evidence of death for, and
+         * {@code ~probesInstalled} is silence.
+         */
+        public String probesInstalledBase64;
     }
 
     public static final class Tier2 {
@@ -37,7 +58,32 @@ public final class WindowPayload {
         public String bucketScheme = "loglinear-16-v1";
     }
 
-    /** CONTRACTS v2. The collector rejects anything it does not recognise. */
+    /**
+     * One runtime caller-&gt;callee edge, additively counted (SCOPE-v3, CONTRACTS section 2).
+     *
+     * <p>Both ends are identified the way {@link Tier2} identifies its method: by
+     * {@code (class, idx)} from the build-time manifest, never by an id of the agent's. Raw
+     * counts only — the count is the number of times the edge was observed <b>in sampled
+     * traces</b>, so the collector scales it by {@code agentHealth.edgesSampleRate}.
+     */
+    public static final class Edge {
+        public String fromClass;
+        public int fromIdx;
+        public String toClass;
+        public int toIdx;
+        public long count;
+    }
+
+    /**
+     * CONTRACTS v2. The collector rejects anything it does not recognise.
+     *
+     * <p><b>Still 2 after the edge tier was added, deliberately.</b> {@code edges[]} and the
+     * {@code agentHealth.edges*} counters are purely additive and a v2 reader ignores unknown
+     * keys, whereas the collector refuses any {@code schemaVersion} it does not know exactly
+     * ({@code decode.py}: "schemaVersion N != 2; refusing to merge"). Bumping it here would make
+     * every deployed collector drop every window, including its coverage — the document's
+     * contract version is bumped instead.
+     */
     public static final int WIRE_SCHEMA_VERSION = 2;
 
     public int schemaVersion = WIRE_SCHEMA_VERSION;
@@ -75,6 +121,12 @@ public final class WindowPayload {
     /** A foreign retransform put our probes back on a class we had stripped (G5 section 7). */
     public long stripReArms;
     /**
+     * Tier-1b could not tell which of a class's probe slots carry a probe, so it left them
+     * installed. Structurally impossible; counted rather than assumed. Cost only — coverage in
+     * this window is unaffected, so this is deliberately not {@code degraded}.
+     */
+    public long stripMaskMissing;
+    /**
      * {@code ax.include.packages} is set and not one class has been instrumented (G5-BUG-1).
      * "I was configured to do work and did none" is not a clean run, and a window carrying this
      * flag must never be read as evidence that the application is dead.
@@ -82,6 +134,34 @@ public final class WindowPayload {
     public boolean scopeMatchedNothing;
     /** {@link #classesLoaded} hit its cap: absence from it no longer means "never loaded". */
     public boolean classesLoadedTruncated;
+
+    // ---- call-edge tier (SCOPE-v3). All raw counts; all inside agentHealth. ----
+    /** Is the edge tier on in this JVM? Off by default, so absence of edges is not a failure. */
+    public boolean edgesEnabled;
+    /**
+     * 1-in-N root entries traced. Not a counter, but the window's edge counts cannot be
+     * interpreted without it — the same reason {@code clockNs} lives here.
+     */
+    public int edgesSampleRate;
+    /** Root invocations actually sampled. The denominator for every count in {@link #edges}. */
+    public long edgesSampledRoots;
+    /** Edges the drain thread folded into this window. */
+    public long edgesRecorded;
+    /** Edge events the ring rejected (drop-on-full, C27). */
+    public long edgesDropped;
+    /** Sampled root invocations that hit {@code ax.edges.max.depth}, one count each. */
+    public long edgesTruncatedDepth;
+    /** Sampled root invocations that hit {@code ax.edges.max.per.root}, one count each. */
+    public long edgesTruncatedRoot;
+    /** Distinct edges refused because {@code ax.edges.max.distinct} was reached. */
+    public long edgesTruncatedDistinct;
+    /**
+     * The edge tier latched itself off after an unexpected Throwable. Its own counter, NOT
+     * {@code degraded}: coverage and tier-2 in this window are still valid evidence.
+     */
+    public long edgeTierFailures;
+    /** The drain thread reset a leaked trace gate. Non-zero means a trace was never closed. */
+    public long edgeTracesReaped;
 
     /**
      * Every class the transformer was handed inside {@code ax.include.packages}, whether or not
@@ -97,4 +177,6 @@ public final class WindowPayload {
     public List<String> instrumentedClasses = new ArrayList<String>();
     public List<Coverage> coverage = new ArrayList<Coverage>();
     public List<Tier2> tier2 = new ArrayList<Tier2>();
+    /** Additive, alongside {@link #coverage} and {@link #tier2}. Empty when the tier is off. */
+    public List<Edge> edges = new ArrayList<Edge>();
 }

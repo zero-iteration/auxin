@@ -12,6 +12,25 @@ Plus the post-freeze additions: NOT_DYNAMICALLY_OBSERVABLE (C51),
 short-circuitable methods, the C50 evidence gate, the C55 rule-class kill
 switch and the C54 rate cap.
 
+Bug #18 adds the installed-probe gate, and it is the same shape of rule as the
+runtime call graph below -- a zero that means NOTHING must not be read as a
+zero that means SOMETHING::
+
+    probes                        -> liveness (a set bit means it ran)
+    probesInstalled & ~probes     -> the ONLY death evidence
+    ~probesInstalled              -> SILENCE. not evidence of anything.
+
+An index the emitter never installed a probe at is never written by anything,
+so its bit is permanently zero. `ax.tier1.enabled=false` makes that true of
+EVERY index in a JVM while every method stays `dynamicallyObservable: true` --
+which is why the manifest cannot express this and the mask has to.
+
+SCOPE-v3 adds the sampled runtime call graph, and it enters the rule in ONE
+direction only. There is no `AND runtime-unreachable` clause above and there
+never can be: the tier samples 1-in-N root entries, so absence of an edge is
+absence of data. An OBSERVED inbound edge, on the other hand, is positive
+proof of life and short-circuits straight to LIVE.
+
 Two properties this module must never lose:
 
 * **UNKNOWN is the default.** Status is computed by starting at UNKNOWN and
@@ -37,12 +56,14 @@ from ax_server.analysis.models import (
     EligibilityClass,
     MethodRef,
     Status,
+    effective_eligibility,
 )
 from ax_server.analysis.phases import PhaseCoverage
 from ax_server.analysis.suppression import SuppressionRule
 
 __all__ = [
     "BLOCKING_REASON_HEADS",
+    "NON_EVIDENCE_REASON_HEADS",
     "MethodFacts",
     "RuleOutcome",
     "evaluate",
@@ -58,6 +79,7 @@ BLOCKING_REASON_HEADS: frozenset[str] = frozenset(
         "public-api-surface",
         "not-dynamically-observable",
         "de-instrumented",
+        "no-probe-installed",
         "short-circuitable",
         "class-never-loaded",
         "static-reachable",
@@ -68,8 +90,15 @@ BLOCKING_REASON_HEADS: frozenset[str] = frozenset(
         "rule-class-disabled",
         "rate-limited",
         "runtime-observed",
+        "runtime-edge-observed",
     }
 )
+
+#: Reason heads the rule emits that are NOT evidence of anything and must
+#: never appear in `blockers` -- nor be mistaken for support for a nomination.
+#: `runtime-edge-absent` is here because the edge graph is sampled: it is
+#: narrated for the audit trail and contributes nothing to the decision.
+NON_EVIDENCE_REASON_HEADS: frozenset[str] = frozenset({"runtime-edge-absent"})
 
 
 def first_blocking_reason(reasons: list[str]) -> str | None:
@@ -97,9 +126,41 @@ class MethodFacts:
     usable_windows: int
     excluded_windows: int
     entry_point_kind: str = "none"
+    # -- installed-probe mask (bug #18) --------------------------------
+    # TRI-STATE, and there is deliberately no `probe_missing: bool` here for
+    # the same reason there is no `runtime_reachable: bool` below: a boolean
+    # invites "no mask reported" to be read as "no probe installed", and that
+    # reading deletes every candidate in a pre-#18 build without saying so.
+    #
+    #   True   a probe exists at this index in some JVM -> an unset bit is a
+    #          real observation of non-execution
+    #   False  NO JVM ever installed one -> the bit is zero because nothing
+    #          can write it, and the clause BLOCKS
+    #   None   no mask was reported for this class -> the clause ABSTAINS
+    probe_installed: bool | None = None
     efp_disabled_key: str | None = None
     rate_limit_reason: str | None = None
     min_window_days: int = 0
+    # -- SCOPE-v3 sampled runtime call graph ---------------------------
+    # Distinct from `static_reachable` above and never merged with it. There
+    # is no `runtime_reachable: bool` here for a reason: the only two states
+    # this tier can produce are "observed" (> 0 edges) and "no information"
+    # (0 edges), and a boolean invites the second to be read as the negation
+    # of the first.
+    #: Distinct OBSERVED inbound edges. 0 means NOTHING IS KNOWN.
+    runtime_inbound_edges: int = 0
+    runtime_outbound_edges: int = 0
+    #: Raw observations in sampled traces behind those inbound edges.
+    runtime_inbound_observations: int = 0
+    runtime_edges_sample_rate: int | None = None
+    #: Did the edge tier report at all for this build? When False the rule
+    #: stays silent about edges: a tier that never spoke fired no rule.
+    runtime_edges_reported: bool = False
+
+    @property
+    def runtime_reachable(self) -> bool | None:
+        """True when an inbound edge was observed, else None. NEVER False."""
+        return True if self.runtime_inbound_edges > 0 else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +224,42 @@ def evaluate(f: MethodFacts) -> RuleOutcome:
     else:
         reasons.append("dynamically-observable: manifest declares a real probe frame")
 
+    # 4b. PROBE INSTALLATION -- BUG #18. The probe array is sized to the
+    #     manifest's probeCount, but the emitter installs a probe at only some
+    #     of those indices, and an index with no probe is NEVER WRITTEN BY
+    #     ANYTHING. Its bit is permanently zero.
+    #
+    #     Note there is no `not f.probe_installed` and no `== 0` anywhere in
+    #     this function: the three states are read with `is`, so "no mask was
+    #     reported" can never collapse into "no probe was installed" (which
+    #     would silently erase every candidate in a pre-#18 build) and
+    #     "no probe was installed" can never collapse into "nothing is known"
+    #     (which is bug #18 itself). An AST test pins that.
+    # `effective_eligibility` is the ONE place the manifest's class and the
+    # runtime mask are combined, and it is shared with the engine, so the
+    # reason text here and the `eligibility` field an operator filters on can
+    # never disagree about which of the three cases this is.
+    if effective_eligibility(eligibility, f.probe_installed) is (
+        EligibilityClass.NO_PROBE_INSTALLED
+    ):
+        reasons.append(
+            "no-probe-installed: the manifest declares this method dynamically "
+            f"observable, but NO JVM ever installed a probe at index {f.method.idx} "
+            "-- ax.tier1.enabled=false, frame emission unsupported for this "
+            "bytecode shape, or a class-file fallback. Its bit is zero because "
+            "nothing can write it, not because the method never ran, so this is "
+            "silence and not evidence (bug #18)"
+        )
+        blockers.append("no-probe-installed")
+    elif eligibility is EligibilityClass.OBSERVABLE and f.probe_installed is True:
+        reasons.append(
+            "probe-installed: a probe really exists at this index, so an unset bit "
+            "is a real observation of non-execution (bug #18)"
+        )
+    # `is None` -- no window reported a mask for this class -- narrates
+    # nothing, exactly as an edge tier that never spoke fires no rule. A
+    # clause that cannot see is not a clause that saw nothing.
+
     # 5. SHORT-CIRCUITABLE -- a Spring proxy, a warm @Cacheable, a
     #    @CircuitBreaker fallback, a @Retryable/@Recover path or an
     #    early-returning filter can serve the feature without the target body
@@ -208,6 +305,41 @@ def evaluate(f: MethodFacts) -> RuleOutcome:
             "means unknown, not dead (A5 measured 61% of executed methods missing)"
         )
         blockers.append("static-unresolved")
+
+    # 8b. RUNTIME CALL EDGES -- SCOPE-v3. ONE-DIRECTIONAL BY CONSTRUCTION.
+    #
+    #     present  => LIVE, full stop. A sampled trace saw a real caller enter
+    #                 this method in production. Nothing over-approximates
+    #                 here: the edge happened.
+    #     absent   => NOTHING. Not a blocker, not support, not a tiebreak.
+    #                 The tier samples 1-in-N root entries and is depth-,
+    #                 per-root- and distinct-bounded with drop-on-full, so the
+    #                 hottest method in the build can legitimately show zero
+    #                 edges. CONTRACTS 2 v3: "Its absence is never evidence of
+    #                 death... `edges[]` must never feed a DEAD_CANDIDATE
+    #                 verdict."
+    #
+    # Note there is no `else: blockers.append(...)` below, and no clause
+    # anywhere in this function that reads `runtime_inbound_edges == 0`. That
+    # absence is the enforcement.
+    if f.runtime_inbound_edges > 0:
+        rate = f.runtime_edges_sample_rate
+        scale = f"1-in-{rate}" if rate else "an undeclared rate"
+        reasons.append(
+            f"runtime-edge-observed: {f.runtime_inbound_edges} observed inbound edge(s), "
+            f"{f.runtime_inbound_observations} sampled observation(s) at {scale} -- a real "
+            "caller really entered this method in production, so it is LIVE regardless of "
+            "the probe bits (SCOPE-v3)"
+        )
+        blockers.append("runtime-edge-observed")
+    elif f.runtime_edges_reported:
+        reasons.append(
+            "runtime-edge-absent: no observed inbound edge, which is NOT evidence -- the "
+            "edge tier is sampled per root entry and additionally depth-, per-root- and "
+            "distinct-bounded with drop-on-full, so absence carries no information and is "
+            "excluded from this verdict entirely (CONTRACTS 2 v3)"
+        )
+        # Intentionally NOT a blocker and intentionally NOT support.
 
     # 9. EVIDENCE QUALITY -- CONTRACTS 2 + C50.
     if f.usable_windows == 0:
@@ -260,6 +392,15 @@ def evaluate(f: MethodFacts) -> RuleOutcome:
     if f.observed:
         return RuleOutcome(LIVE, reasons, tuple(blockers))
 
+    # An OBSERVED inbound edge is the same kind of fact as a set probe: it is
+    # positive, it cannot be produced by a lossy tier inventing data, and it
+    # comes from the same C50-gated window. So presence => LIVE, full stop --
+    # even where the probe bit is missing, which happens legitimately when
+    # tier-1b has stripped the callee's probe (C4) while the edge tier keeps
+    # running, the two tiers being independent by design.
+    if f.runtime_inbound_edges > 0:
+        return RuleOutcome(LIVE, reasons, tuple(blockers))
+
     if f.suppression is not None:
         # CONTRACTS 5 is explicit: "A suppressed method is UNKNOWN".
         return RuleOutcome(UNKNOWN, reasons, tuple(blockers))
@@ -267,6 +408,12 @@ def evaluate(f: MethodFacts) -> RuleOutcome:
     if f.method.eligibility is EligibilityClass.NOT_DYNAMICALLY_OBSERVABLE:
         return RuleOutcome(NOT_DYNAMICALLY_OBSERVABLE, reasons, tuple(blockers))
 
+    # EVERY clause that blocks lands here, and this gate is the structural
+    # reason none of them can leak into a nomination -- including
+    # `no-probe-installed`, which is the one that used to read as death. There
+    # is exactly one DEAD_CANDIDATE return below it and none above it; an AST
+    # test pins that, so a future clause cannot be added downstream of the
+    # decision by accident.
     if blockers:
         return RuleOutcome(UNKNOWN, reasons, tuple(blockers))
 

@@ -141,11 +141,104 @@ class McpServer:
             lambda a: self.api.summary(str(a["buildSha"])),
         )
         self._add(
+            "gt_instrumentation_gaps",
+            "Which methods COULD have been observed at all. Reports, separately, the "
+            "methods the manifest says cannot be covered (C51), the ones our own "
+            "tier-1b de-instrumented (C4), and the ones that are observable but that "
+            "NO JVM ever installed a probe at (bug #18: ax.tier1.enabled=false, or "
+            "frame emission unsupported for a bytecode shape). Read this BEFORE "
+            "concluding anything from a low dead-candidate count: an uninstrumented "
+            "probe index is permanently zero because nothing can write it, which is "
+            "silence, not evidence that the method never ran.",
+            {**_BUILD_ARG, "limit": {"type": "integer", "default": 50}},
+            ["buildSha"],
+            lambda a: self.api.instrumentation_gaps(
+                str(a["buildSha"]), limit=int(a.get("limit", 50))
+            ),
+        )
+        self._add(
             "gt_proposals",
             "Standing DEAD_CANDIDATE proposals with first_proposed_at (C53).",
             dict(_BUILD_ARG),
             ["buildSha"],
             lambda a: self.api.proposals(str(a["buildSha"])),
+        )
+        # -- SCOPE-v3 runtime call graph -------------------------------
+        # The descriptions carry the sampling caveat because an LLM reading
+        # `sampledObservations: 4` would otherwise report "called 4 times",
+        # and an empty caller list would otherwise be read as "nothing calls
+        # this" -- the exact inference CONTRACTS 2 v3 forbids.
+        self._add(
+            "gt_callers_of",
+            "OBSERVED runtime callers of a method, from the sampled call-edge tier. "
+            "Counts are observations in sampled traces, NOT calls: multiply by "
+            "edgesSampleRate for an estimate. An empty list means nothing was "
+            "SAMPLED, never that nothing calls the method.",
+            {
+                **_BUILD_ARG,
+                "class": {"type": "string", "description": "Fully qualified class name."},
+                "method": {
+                    "type": "string",
+                    "description": "Method name, or name(descriptor) for an overload.",
+                },
+                "limit": {"type": "integer", "default": 50},
+            },
+            ["buildSha", "class", "method"],
+            lambda a: self.api.callers_of(
+                str(a["buildSha"]), str(a["class"]), str(a["method"]),
+                limit=int(a.get("limit", 50)),
+            ),
+        )
+        self._add(
+            "gt_callees_of",
+            "OBSERVED runtime callees of a method, from the sampled call-edge tier. "
+            "Same sampling caveat as gt_callers_of: counts are sampled observations, "
+            "NOT calls, and an empty list is not evidence that the method calls "
+            "nothing.",
+            {
+                **_BUILD_ARG,
+                "class": {"type": "string", "description": "Fully qualified class name."},
+                "method": {
+                    "type": "string",
+                    "description": "Method name, or name(descriptor) for an overload.",
+                },
+                "limit": {"type": "integer", "default": 50},
+            },
+            ["buildSha", "class", "method"],
+            lambda a: self.api.callees_of(
+                str(a["buildSha"]), str(a["class"]), str(a["method"]),
+                limit=int(a.get("limit", 50)),
+            ),
+        )
+        self._add(
+            "gt_blast_radius",
+            "Before deleting a method: its OBSERVED (sampled) inbound callers and "
+            "whether any of them is itself LIVE, plus the separate (61%-unsound, "
+            "over-approximate) static callers. Runtime and static are never merged. No "
+            "observed caller is NOT evidence that none exists -- the tier is sampled.",
+            {
+                **_BUILD_ARG,
+                "class": {"type": "string", "description": "Fully qualified class name."},
+                "method": {
+                    "type": "string",
+                    "description": "Method name, or name(descriptor) for an overload.",
+                },
+            },
+            ["buildSha", "class", "method"],
+            lambda a: self.api.blast_radius(
+                str(a["buildSha"]), str(a["class"]), str(a["method"])
+            ),
+        )
+        self._add(
+            "gt_hot_paths",
+            "The highest-count OBSERVED call edges for a build. A ranking of relative "
+            "sampled volume, not call totals, and only comparable among edges recorded "
+            "at the same edgesSampleRate.",
+            {**_BUILD_ARG, "limit": {"type": "integer", "default": 20}},
+            ["buildSha"],
+            lambda a: self.api.hot_paths(
+                str(a["buildSha"]), limit=int(a.get("limit", 20))
+            ),
         )
         self._add(
             "gt_effective_false_positives",

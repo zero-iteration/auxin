@@ -62,6 +62,22 @@ public final class Health {
      * one WARN per JVM so it can never read as a clean run.
      */
     public static final String SKIP_IN_SCOPE_VETOED = "inScopeVetoed";
+    /**
+     * A method whose shape the call-edge tier cannot instrument: a {@code jsr}/{@code ret}
+     * subroutine, a boundary method that is a constructor (the handler would have to merge an
+     * {@code uninitializedThis} frame), or a boundary method whose frames could not be read
+     * expanded. Tier-1 and tier-2 are unaffected for that method; it simply records no edges.
+     */
+    public static final String SKIP_EDGE_UNSUPPORTED = "edgeUnsupported";
+    /**
+     * A class whose loader cannot see the agent jar. The edge tier emits a direct
+     * {@code EdgeRuntime} call for the same reason tier-2 does, and for the same reason it
+     * cannot be bridged: any {@code Object.equals} hop allocates per invocation. Tier-1 still
+     * works through the bridge; edges degrade off, never to a NoClassDefFoundError.
+     */
+    public static final String SKIP_EDGES_NOT_BRIDGEABLE = "edgesNotBridgeable";
+    /** The edge tier's 24-bit id space is exhausted (16.7M instrumented methods). */
+    public static final String SKIP_EDGE_ID_EXHAUSTED = "edgeIdSpaceExhausted";
 
     private static final AtomicLong TRANSFORM_FAILURES = new AtomicLong();
     private static final AtomicLong CLASSES_INSTRUMENTED = new AtomicLong();
@@ -69,6 +85,7 @@ public final class Health {
     private static final AtomicLong STRIP_FAILURES = new AtomicLong();
     private static final AtomicLong STRIPS_BLOCKED = new AtomicLong();
     private static final AtomicLong STRIP_REARMS = new AtomicLong();
+    private static final AtomicLong STRIP_MASK_MISSING = new AtomicLong();
     private static final AtomicLong FLUSH_FAILURES = new AtomicLong();
     private static final AtomicLong FLUSHES_OK = new AtomicLong();
     private static final AtomicLong PROBES_INSTALLED = new AtomicLong();
@@ -76,6 +93,23 @@ public final class Health {
 
     /** Hot path: incremented on an application thread when the ring rejects an event. */
     public static final LongAdder RING_DROPPED = new LongAdder();
+
+    // ---- call-edge tier (SCOPE-v3) ----
+    // All four are touched on an application thread, and all four only on a SAMPLED path:
+    // once per sampled root invocation, or once per root invocation whose caps bit. At the
+    // default 1-in-1024 that is three orders of magnitude below the per-call rate, which is why
+    // a LongAdder is affordable here and is not affordable in EdgeRuntime.record().
+    /** Root invocations that were sampled. The denominator for every edge count on the wire. */
+    public static final LongAdder EDGE_ROOTS_SAMPLED = new LongAdder();
+    /** The edge ring rejected an event (drop-on-full, C27). */
+    public static final LongAdder EDGE_RING_DROPPED = new LongAdder();
+    /** Root invocations that hit {@code ax.edges.max.depth}. Counted once per invocation. */
+    public static final LongAdder EDGES_TRUNCATED_DEPTH = new LongAdder();
+    /** Root invocations that hit {@code ax.edges.max.per.root}. Counted once per invocation. */
+    public static final LongAdder EDGES_TRUNCATED_ROOT = new LongAdder();
+
+    private static final AtomicLong EDGE_TIER_FAILURES = new AtomicLong();
+    private static final AtomicLong EDGE_TRACES_REAPED = new AtomicLong();
 
     private static final ConcurrentHashMap<String, AtomicLong> SKIPPED =
             new ConcurrentHashMap<String, AtomicLong>();
@@ -128,6 +162,22 @@ public final class Health {
      * (G5 section 7). Correctness was never affected; the zero-overhead claim was.
      */
     public static void stripReArm() { STRIP_REARMS.incrementAndGet(); }
+
+    /**
+     * Tier-1b could not decide whether a class is strippable, so it left the probes installed.
+     *
+     * <p>Raised when a class has a probe array but no usable installed-probe mask, or one whose
+     * length disagrees with the array. Both are structurally impossible — the mask is recorded
+     * before the array, from the same manifest {@code probeCount} — which is precisely why the
+     * case gets a counter instead of an assumption: the fail-open answer is "keep the probes",
+     * and a silent fail-open is how the zero-overhead claim went wrong in the first place.
+     *
+     * <p>Its own counter, not {@link #stripBlocked()} (which means "the retransform ran and
+     * removed nothing") and not a {@code classesSkipped{reason}} entry (which means "we did not
+     * instrument this class" — the opposite of a class whose probes are all present). Cost only;
+     * coverage is unaffected.
+     */
+    public static void stripMaskMissing() { STRIP_MASK_MISSING.incrementAndGet(); }
     public static void flushOk() { FLUSHES_OK.incrementAndGet(); }
     public static void flushFailure() { FLUSH_FAILURES.incrementAndGet(); }
 
@@ -137,11 +187,30 @@ public final class Health {
     public static long stripFailures() { return STRIP_FAILURES.get(); }
     public static long stripsBlocked() { return STRIPS_BLOCKED.get(); }
     public static long stripReArms() { return STRIP_REARMS.get(); }
+    public static long stripMasksMissing() { return STRIP_MASK_MISSING.get(); }
     public static long flushFailures() { return FLUSH_FAILURES.get(); }
     public static long flushesOk() { return FLUSHES_OK.get(); }
     public static long probesInstalled() { return PROBES_INSTALLED.get(); }
     public static long tier2Installed() { return TIER2_INSTALLED.get(); }
     public static long ringDropped() { return RING_DROPPED.sum(); }
+
+    /**
+     * The edge tier latched itself off (EdgeRuntime.fail). Deliberately NOT
+     * {@link #degrade(String)}: coverage, tier-2 and the strip are untouched, so a window with
+     * this counter set is still valid evidence about everything except edges. Conflating the two
+     * would throw away good coverage data because a convenience tier misbehaved.
+     */
+    public static void edgeTierFailure() { EDGE_TIER_FAILURES.incrementAndGet(); }
+
+    /** The drain thread reset a leaked edge-trace gate (EdgeRuntime.reapStaleTraces). */
+    public static void edgeTraceReaped() { EDGE_TRACES_REAPED.incrementAndGet(); }
+
+    public static long edgeTierFailures() { return EDGE_TIER_FAILURES.get(); }
+    public static long edgeTracesReaped() { return EDGE_TRACES_REAPED.get(); }
+    public static long edgeRootsSampled() { return EDGE_ROOTS_SAMPLED.sum(); }
+    public static long edgeRingDropped() { return EDGE_RING_DROPPED.sum(); }
+    public static long edgesTruncatedDepth() { return EDGES_TRUNCATED_DEPTH.sum(); }
+    public static long edgesTruncatedRoot() { return EDGES_TRUNCATED_ROOT.sum(); }
 
     /** Snapshot of ax_classes_skipped_total{reason}. */
     public static Map<String, Long> skipped() {

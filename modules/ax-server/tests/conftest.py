@@ -11,6 +11,7 @@ from ax_server.analysis.engine import AnalysisConfig, AnalysisEngine
 from ax_server.analysis.manifest import load_manifest
 from ax_server.analysis.phases import PhaseCalendar, PhaseOccurrence
 from ax_server.analysis.proposals import SqliteProposalLedger
+from ax_server.analysis.runtime_edges import manifest_method_index
 from ax_server.analysis.suppression import Suppressions
 from ax_server.collector.service import CollectorService
 from ax_server.store.bitset import from_indices
@@ -44,6 +45,8 @@ def payload(
     environment: str | None = "production",
     instance_id: str = "pod-7f3a",
     schema_version: int = 1,
+    edges: list[dict[str, Any]] | None = None,
+    edge_health: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "schemaVersion": schema_version,
@@ -64,8 +67,118 @@ def payload(
         "coverage": coverage or [],
         "tier2": tier2 or [],
     }
+    if edges is not None:
+        # CONTRACTS 2 v3: the key is ALWAYS present on a v3 producer, and an
+        # absent key is a different fact from an empty array -- so the builder
+        # omits it entirely unless asked, which is how a v2 agent looks.
+        body["edges"] = edges
+        body["agentHealth"].update(DEFAULT_EDGE_HEALTH)
+    if edge_health is not None:
+        body["agentHealth"].update(edge_health)
     if environment is not None:
         body["jvmClassification"] = {"env": environment}
+    return body
+
+
+#: The v3 counters as a healthy 1-in-1024 deployment reports them.
+DEFAULT_EDGE_HEALTH: dict[str, Any] = {
+    "edgesEnabled": True,
+    "edgesSampleRate": 1024,
+    "edgesSampledRoots": 41,
+    "edgesRecorded": 15,
+    "edgesDropped": 0,
+    "edgesTruncatedDepth": 1,
+    "edgesTruncatedRoot": 0,
+    "edgesTruncatedDistinct": 0,
+    "edgeTierFailures": 0,
+    "edgeTracesReaped": 0,
+}
+
+
+def installed_mask(*indices: int, width: int = 1) -> str:
+    """base64 of a `coverage[].probesInstalled` mask (bug #18).
+
+    Packed exactly like `probes` (LSB = idx 0) because it indexes the same
+    build-time probe indices. `width` forces at least one byte so the
+    tier-1-disabled case ships a REAL all-zero mask ("AA==") rather than an
+    empty string -- an all-zero mask and an absent key are different facts and
+    the tests need to exercise both.
+    """
+    return base64.b64encode(from_indices(indices, size_bytes=width)).decode("ascii")
+
+
+#: What a healthy JVM reports having installed, per class in
+#: tests/fixtures/manifest.json: every index EXCEPT the C51
+#: `dynamicallyObservable: false` one (Constants#maxRetries, idx 0), which the
+#: emitter skips for a reason the manifest already explains.
+FULLY_INSTALLED: dict[str, list[int]] = {
+    "com.acme.shipping.RateSelector": [0, 1, 2, 3],
+    "com.acme.api.PublicGateway": [0],
+    "com.acme.emergency.KillSwitch": [0],
+    "com.acme.util.Constants": [1],
+    "com.acme.billing.MonthEndReport": [0],
+    "com.acme.lib.LibOnlyUsedByTest": [0],
+}
+
+#: What a JVM with `ax.tier1.enabled=false` reports: every bitset all-zero,
+#: every method still `dynamicallyObservable: true`. Before bug #18 was closed
+#: this was indistinguishable from "every method in your codebase is dead".
+TIER1_DISABLED: dict[str, list[int]] = {cls: [] for cls in FULLY_INSTALLED}
+
+
+def realistic_payload_installed(
+    day: int,
+    *,
+    installed: dict[str, list[int]] | None = None,
+    strip_mask_missing: int | None = None,
+    instance_id: str = "pod-7f3a",
+    probes_set: dict[str, list[int]] | None = None,
+) -> dict[str, Any]:
+    """`realistic_payload` plus CONTRACTS 2 `coverage[].probesInstalled`.
+
+    `installed` maps class -> the indices THIS JVM actually installed a probe
+    at; the key is always written, so every record carries a mask (that is
+    what the post-#18 agent does). `probes_set` optionally overrides the
+    liveness bits so a window can report "installed, and nothing ran".
+    """
+    body = realistic_payload(day)
+    body["instanceId"] = instance_id
+    masks = FULLY_INSTALLED if installed is None else installed
+    for rec in body["coverage"]:
+        rec["probesInstalled"] = installed_mask(*masks.get(rec["class"], ()))
+        if probes_set is not None:
+            rec["probes"] = probes(*probes_set.get(rec["class"], ()))
+    if strip_mask_missing is not None:
+        body["agentHealth"]["stripMaskMissing"] = strip_mask_missing
+    return body
+
+
+RS = "com.acme.shipping.RateSelector"
+GATEWAY = "com.acme.api.PublicGateway"
+
+#: `(class, idx)` on both ends -- the same manifest identity `tier2[]` uses.
+#: dispatch -> pick -> normalise, plus cachedLookup -> normalise.
+DEFAULT_EDGES: list[dict[str, Any]] = [
+    {"fromClass": GATEWAY, "fromIdx": 0, "toClass": RS, "toIdx": 0, "count": 7},
+    {"fromClass": RS, "fromIdx": 0, "toClass": RS, "toIdx": 1, "count": 5},
+    {"fromClass": RS, "fromIdx": 3, "toClass": RS, "toIdx": 1, "count": 3},
+]
+
+
+def realistic_payload_v3(
+    day: int,
+    *,
+    instance_id: str = "pod-7f3a",
+    edges: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """`realistic_payload` plus the CONTRACTS 2 v3 `edges[]` tier."""
+    body = realistic_payload(day)
+    body["instanceId"] = instance_id
+    # Copied, not aliased: a test that mutates one entry must not edit the
+    # shared constant out from under every other test.
+    source = DEFAULT_EDGES if edges is None else edges
+    body["edges"] = [dict(e) for e in source]
+    body["agentHealth"].update(DEFAULT_EDGE_HEALTH)
     return body
 
 
@@ -173,10 +286,62 @@ def engine(store, manifest, suppressions, calendar) -> AnalysisEngine:
 
 
 @pytest.fixture
+def edge_collector(store: SqliteStore, manifest) -> CollectorService:
+    """A collector that validates `edges[]` endpoints against the manifest.
+
+    Separate from `collector` on purpose: the default is "no manifest, cannot
+    check", and the dangling-edge tests need both halves of that.
+    """
+    return CollectorService(store, known_methods=manifest_method_index(manifest))
+
+
+@pytest.fixture
+def ingested_v3(edge_collector: CollectorService) -> CollectorService:
+    """Days 0..3 from TWO pods, every window carrying `edges[]`.
+
+    Eight windows, so edge counts must be 8x a single window's while the
+    coverage bitset is unchanged -- the additive-vs-OR contrast, ingested.
+    """
+    for day in range(4):
+        for pod in ("pod-a", "pod-b"):
+            edge_collector.ingest(realistic_payload_v3(day, instance_id=pod))
+    return edge_collector
+
+
+@pytest.fixture
 def ingested(collector: CollectorService) -> CollectorService:
     """Four contiguous 24h production windows, days 0..3."""
     for day in range(4):
         collector.ingest(realistic_payload(day))
+    return collector
+
+
+@pytest.fixture
+def ingested_installed(collector: CollectorService) -> CollectorService:
+    """Days 0..3 from a post-#18 agent: every record carries the install mask.
+
+    The same four windows as `ingested`, so a verdict that differs between the
+    two fixtures differs BECAUSE of the mask and nothing else.
+    """
+    for day in range(4):
+        collector.ingest(realistic_payload_installed(day))
+    return collector
+
+
+@pytest.fixture
+def ingested_tier1_disabled(collector: CollectorService) -> CollectorService:
+    """Days 0..3 from a JVM with `ax.tier1.enabled=false`.
+
+    Every coverage bitset all-zero, every install mask all-zero, every method
+    still `dynamicallyObservable: true`. This is the shape that used to read
+    as "every method in your codebase is dead" (bug #18).
+    """
+    for day in range(4):
+        collector.ingest(
+            realistic_payload_installed(
+                day, installed=TIER1_DISABLED, probes_set={}
+            )
+        )
     return collector
 
 

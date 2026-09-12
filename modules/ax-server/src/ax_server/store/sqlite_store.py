@@ -16,12 +16,21 @@ from ax_server.store.bitset import is_set, newly_set, or_merge, set_bits
 from ax_server.store.errors import SchemaMismatch
 from ax_server.store.models import (
     AgentHealth,
+    EdgeAggregate,
+    EdgeEndpoint,
+    EdgeHealth,
     IngestWindow,
     Window,
     epoch_ms,
     from_epoch_ms,
 )
-from ax_server.store.port import IngestAudit, Store, WindowAttribution
+from ax_server.store.port import (
+    EdgeStore,
+    IngestAudit,
+    ProbeInstallStore,
+    Store,
+    WindowAttribution,
+)
 
 __all__ = ["SqliteStore"]
 
@@ -47,6 +56,32 @@ CREATE TABLE IF NOT EXISTS class_coverage (
     cls         TEXT NOT NULL,
     schema_hash TEXT NOT NULL,
     probes      BLOB NOT NULL,
+    PRIMARY KEY (build_sha, cls)
+);
+
+-- BUG #18: the probe array is sized to the manifest's `probeCount` -- every
+-- probe-eligible method -- but the emitter installs a probe at only SOME of
+-- those indices. An index with no probe is NEVER WRITTEN BY ANYTHING, so its
+-- bit is permanently zero, and shipping it alongside genuinely-zero bits made
+-- a JVM with `ax.tier1.enabled=false` look like a codebase full of dead code.
+--
+-- Merged as a bitwise OR across pods and windows, EXACTLY as coverage is:
+-- different JVMs legitimately install different probe sets (a class-file-<55
+-- fallback here, a `frameEmissionUnsupported` method there), and the union is
+-- the conservative answer -- "some JVM could have observed this index".
+--
+-- A separate table rather than a column on `class_coverage` so that ROW
+-- EXISTENCE carries the "a mask was reported at all" fact: an all-zero mask
+-- is a positive report and an absent row is silence, and an all-zero mask can
+-- be zero bytes wide.
+CREATE TABLE IF NOT EXISTS class_probes_installed (
+    build_sha    TEXT NOT NULL,
+    cls          TEXT NOT NULL,
+    schema_hash  TEXT NOT NULL,
+    installed    BLOB NOT NULL,
+    windows      INTEGER NOT NULL,
+    first_ms     INTEGER NOT NULL,
+    last_ms      INTEGER NOT NULL,
     PRIMARY KEY (build_sha, cls)
 );
 
@@ -85,6 +120,59 @@ CREATE TABLE IF NOT EXISTS tier2 (
 );
 CREATE INDEX IF NOT EXISTS tier2_lookup ON tier2(build_sha, cls, idx, window_end_ms);
 
+-- SCOPE-v3: the sampled runtime call-edge tier. Per-window rows are kept
+-- alongside the aggregate so a count can always be traced back to the window
+-- (and therefore the sample rate) that produced it.
+CREATE TABLE IF NOT EXISTS window_edges (
+    window_id     INTEGER NOT NULL,
+    build_sha     TEXT NOT NULL,
+    caller_cls    TEXT NOT NULL,
+    caller_idx    INTEGER NOT NULL,
+    callee_cls    TEXT NOT NULL,
+    callee_idx    INTEGER NOT NULL,
+    observations  INTEGER NOT NULL,
+    sample_rate   INTEGER NOT NULL,
+    window_end_ms INTEGER NOT NULL,
+    PRIMARY KEY (window_id, caller_cls, caller_idx, callee_cls, callee_idx)
+);
+CREATE INDEX IF NOT EXISTS window_edges_build ON window_edges(build_sha, window_end_ms);
+
+-- (build_sha, caller, callee) -> SUMMED sampled observations. Additive, NOT
+-- an OR: `edges[].count` is a per-window delta, `coverage[].probes` is an
+-- accumulated bitset. Same table, opposite semantics, never conflated.
+CREATE TABLE IF NOT EXISTS edge_agg (
+    build_sha       TEXT NOT NULL,
+    caller_cls      TEXT NOT NULL,
+    caller_idx      INTEGER NOT NULL,
+    callee_cls      TEXT NOT NULL,
+    callee_idx      INTEGER NOT NULL,
+    observations    INTEGER NOT NULL,
+    windows         INTEGER NOT NULL,
+    first_seen_ms   INTEGER NOT NULL,
+    last_seen_ms    INTEGER NOT NULL,
+    sample_rate_min INTEGER NOT NULL,
+    sample_rate_max INTEGER NOT NULL,
+    PRIMARY KEY (build_sha, caller_cls, caller_idx, callee_cls, callee_idx)
+);
+-- Both directions are first-class queries ("who calls me" for blast radius,
+-- "what do I call" for tracing a path), so both are indexed. The caller
+-- index is not the PRIMARY KEY prefix by accident -- it is named so the
+-- intent survives a schema edit.
+CREATE INDEX IF NOT EXISTS edge_agg_caller
+    ON edge_agg(build_sha, caller_cls, caller_idx);
+CREATE INDEX IF NOT EXISTS edge_agg_callee
+    ON edge_agg(build_sha, callee_cls, callee_idx);
+CREATE INDEX IF NOT EXISTS edge_agg_hot ON edge_agg(build_sha, observations DESC);
+
+-- sample_rate -> windows seen at it. Returned with every count, because a
+-- count without its rate is uninterpretable (CONTRACTS 2 v3).
+CREATE TABLE IF NOT EXISTS edge_sample_rates (
+    build_sha   TEXT NOT NULL,
+    sample_rate INTEGER NOT NULL,
+    windows     INTEGER NOT NULL,
+    PRIMARY KEY (build_sha, sample_rate)
+);
+
 CREATE TABLE IF NOT EXISTS ingest_rejects (
     reject_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     reason      TEXT NOT NULL,
@@ -102,7 +190,35 @@ def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
 
-class SqliteStore(Store, WindowAttribution, IngestAudit):
+def _int(raw: Mapping[str, object], key: str) -> int:
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value)
+
+
+def _edge_health(raw: Mapping[str, object]) -> EdgeHealth:
+    """Rebuild the v3 edge counters from a persisted `agentHealth` blob.
+
+    Every field defaults to 0/false, so a window recorded by a v2 producer
+    reads back as "the tier said nothing" -- which is the honest answer, and
+    is NOT the same as "the tier ran and found nothing".
+    """
+    return EdgeHealth(
+        enabled=bool(raw.get("edgesEnabled", False)),
+        sample_rate=_int(raw, "edgesSampleRate"),
+        sampled_roots=_int(raw, "edgesSampledRoots"),
+        recorded=_int(raw, "edgesRecorded"),
+        dropped=_int(raw, "edgesDropped"),
+        truncated_depth=_int(raw, "edgesTruncatedDepth"),
+        truncated_root=_int(raw, "edgesTruncatedRoot"),
+        truncated_distinct=_int(raw, "edgesTruncatedDistinct"),
+        tier_failures=_int(raw, "edgeTierFailures"),
+        traces_reaped=_int(raw, "edgeTracesReaped"),
+    )
+
+
+class SqliteStore(Store, WindowAttribution, IngestAudit, EdgeStore, ProbeInstallStore):
     """The one adapter we can actually exercise locally (TOOLCHAIN.md 4).
 
     Thread-safe via a single lock around a single connection. That is enough
@@ -169,6 +285,14 @@ class SqliteStore(Store, WindowAttribution, IngestAudit):
             "clockNs": health.clock_ns,
             "clockDegraded": health.clock_degraded,
             "degraded": health.degraded,
+            # Bug #18. Persisted with the other counters and, like the edge
+            # counters, deliberately NOT folded into `degraded`: a JVM that
+            # could not determine its own install mask still produced good
+            # evidence of LIFE in this window.
+            "stripMaskMissing": health.strip_mask_missing,
+            # CONTRACTS 2 v3. Persisted next to the rest of agentHealth, and
+            # deliberately NOT folded into `degraded`.
+            **health.edges.to_json(),
         }
         with self._lock:
             cur = self._conn.execute(
@@ -261,6 +385,78 @@ class SqliteStore(Store, WindowAttribution, IngestAudit):
                 )
             self._conn.commit()
 
+    # -- ProbeInstallStore (bug #18, optional port extension) -------------
+
+    def merge_probes_installed(
+        self, build_sha: str, cls: str, schema_hash: str, installed: bytes
+    ) -> None:
+        """OR the reported install mask into the stored one.
+
+        Same operation as `merge_coverage` above, on purpose: the mask is the
+        union of what every pod installed, because the question it answers is
+        "could SOME JVM have observed this index?" What differs is only what a
+        zero MEANS -- in `coverage` a zero is an observation, here it is the
+        absence of anything that could ever produce one.
+        """
+        now_ms = self._now_ms()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT schema_hash, installed FROM class_probes_installed"
+                " WHERE build_sha=? AND cls=?",
+                (build_sha, cls),
+            ).fetchone()
+            if row is None:
+                existing = b""
+            else:
+                stored_hash = str(row["schema_hash"])
+                if stored_hash != schema_hash:
+                    # Loud and no write, exactly as for coverage: the mask is
+                    # keyed by build-time probe index, so merging across a
+                    # schema change would point the gate at other methods.
+                    raise SchemaMismatch(build_sha, cls, stored_hash, schema_hash)
+                existing = bytes(row["installed"])
+            merged = or_merge(existing, installed)
+            self._conn.execute(
+                "INSERT INTO class_probes_installed (build_sha, cls, schema_hash, installed,"
+                " windows, first_ms, last_ms) VALUES (?,?,?,?,1,?,?)"
+                " ON CONFLICT(build_sha, cls) DO UPDATE SET"
+                "   installed=excluded.installed,"
+                "   windows=windows+1,"
+                "   first_ms=MIN(first_ms, excluded.first_ms),"
+                "   last_ms=MAX(last_ms, excluded.last_ms)",
+                (build_sha, cls, schema_hash, merged, now_ms, now_ms),
+            )
+            self._conn.commit()
+
+    def probes_installed(self, build_sha: str, cls: str) -> bytes | None:
+        """The merged mask, or None when NO window ever reported one."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT installed FROM class_probes_installed WHERE build_sha=? AND cls=?",
+                (build_sha, cls),
+            ).fetchone()
+        # `is None` on the ROW, not truthiness on the blob: an all-zero mask
+        # is a report, and b"" is falsy.
+        return bytes(row["installed"]) if row is not None else None
+
+    def installed_masks(self, build_sha: str) -> dict[str, bytes]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT cls, installed FROM class_probes_installed WHERE build_sha=?"
+                " ORDER BY cls",
+                (build_sha,),
+            ).fetchall()
+        return {str(r["cls"]): bytes(r["installed"]) for r in rows}
+
+    def install_mask_windows(self, build_sha: str, cls: str) -> int:
+        """How many windows contributed to a class's mask. Adapter extra."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT windows FROM class_probes_installed WHERE build_sha=? AND cls=?",
+                (build_sha, cls),
+            ).fetchone()
+        return int(row["windows"]) if row is not None else 0
+
     def first_seen(self, build_sha: str, cls: str, idx: int) -> datetime | None:
         with self._lock:
             row = self._conn.execute(
@@ -317,6 +513,160 @@ class SqliteStore(Store, WindowAttribution, IngestAudit):
             for i, count in enumerate(buckets):
                 total[i] += int(count)
         return total
+
+    # -- EdgeStore (SCOPE-v3, optional port extension) -------------------
+
+    def record_edges(self, w: IngestWindow) -> int:
+        """Persist `w.edges` and ADD them into the per-build aggregate.
+
+        Deliberately additive. `merge_coverage` three methods up is an
+        idempotent OR because the agent sends an accumulated bitset; this is a
+        sum because the agent sends a per-window observation count. Replaying
+        a window therefore double-counts edges and does not change coverage --
+        that asymmetry is in the contract, not a bug here.
+        """
+        if not w.edges:
+            # Still record the sample rate: a window that reported an EMPTY
+            # graph is evidence about the tier's configuration, and "absent
+            # key" vs "empty graph" are different facts (CONTRACTS 2).
+            if w.edges_present:
+                with self._lock:
+                    self._bump_sample_rate(w.build_sha, w.agent_health.edges.sample_rate)
+                    self._conn.commit()
+            return 0
+
+        rate = int(w.agent_health.edges.sample_rate or 0)
+        when_ms = w.window_end_ms
+        with self._lock:
+            window_id = self._latest_window_id(w)
+            for rec in w.edges:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO window_edges (window_id, build_sha, caller_cls,"
+                    " caller_idx, callee_cls, callee_idx, observations, sample_rate,"
+                    " window_end_ms) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        window_id, w.build_sha, rec.caller_cls, rec.caller_idx,
+                        rec.callee_cls, rec.callee_idx, rec.count, rate, when_ms,
+                    ),
+                )
+                self._conn.execute(
+                    "INSERT INTO edge_agg (build_sha, caller_cls, caller_idx, callee_cls,"
+                    " callee_idx, observations, windows, first_seen_ms, last_seen_ms,"
+                    " sample_rate_min, sample_rate_max) VALUES (?,?,?,?,?,?,1,?,?,?,?)"
+                    " ON CONFLICT(build_sha, caller_cls, caller_idx, callee_cls, callee_idx)"
+                    " DO UPDATE SET"
+                    "   observations=observations+excluded.observations,"
+                    "   windows=windows+1,"
+                    "   first_seen_ms=MIN(first_seen_ms, excluded.first_seen_ms),"
+                    "   last_seen_ms=MAX(last_seen_ms, excluded.last_seen_ms),"
+                    "   sample_rate_min=MIN(sample_rate_min, excluded.sample_rate_min),"
+                    "   sample_rate_max=MAX(sample_rate_max, excluded.sample_rate_max)",
+                    (
+                        w.build_sha, rec.caller_cls, rec.caller_idx, rec.callee_cls,
+                        rec.callee_idx, rec.count, when_ms, when_ms, rate, rate,
+                    ),
+                )
+            self._bump_sample_rate(w.build_sha, rate)
+            self._conn.commit()
+        return len(w.edges)
+
+    def callers_of(self, build_sha: str, cls: str, idx: int) -> list[EdgeAggregate]:
+        return self._edges_where(
+            "build_sha=? AND callee_cls=? AND callee_idx=?", (build_sha, cls, idx)
+        )
+
+    def callees_of(self, build_sha: str, cls: str, idx: int) -> list[EdgeAggregate]:
+        return self._edges_where(
+            "build_sha=? AND caller_cls=? AND caller_idx=?", (build_sha, cls, idx)
+        )
+
+    def hot_edges(self, build_sha: str, limit: int = 50) -> list[EdgeAggregate]:
+        return self._edges_where("build_sha=?", (build_sha,), limit=limit)
+
+    def edge_endpoints(self, build_sha: str) -> tuple[set[EdgeEndpoint], set[EdgeEndpoint]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT caller_cls, caller_idx, callee_cls, callee_idx FROM edge_agg"
+                " WHERE build_sha=?",
+                (build_sha,),
+            ).fetchall()
+        outbound = {(str(r["caller_cls"]), int(r["caller_idx"])) for r in rows}
+        inbound = {(str(r["callee_cls"]), int(r["callee_idx"])) for r in rows}
+        return inbound, outbound
+
+    def edge_sample_rates(self, build_sha: str) -> dict[int, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sample_rate, windows FROM edge_sample_rates WHERE build_sha=?"
+                " ORDER BY sample_rate",
+                (build_sha,),
+            ).fetchall()
+        return {int(r["sample_rate"]): int(r["windows"]) for r in rows}
+
+    def window_edges(self, build_sha: str) -> list[dict[str, object]]:
+        """Per-window edge rows. Adapter extra, for auditing a summed count
+        back to the windows and sample rates it came from."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM window_edges WHERE build_sha=?"
+                " ORDER BY window_end_ms, window_id",
+                (build_sha,),
+            ).fetchall()
+        return [
+            {
+                "windowId": int(r["window_id"]),
+                "caller": [str(r["caller_cls"]), int(r["caller_idx"])],
+                "callee": [str(r["callee_cls"]), int(r["callee_idx"])],
+                "sampledObservations": int(r["observations"]),
+                "edgesSampleRate": int(r["sample_rate"]) or None,
+            }
+            for r in rows
+        ]
+
+    def _edges_where(
+        self, where: str, args: tuple[object, ...], *, limit: int | None = None
+    ) -> list[EdgeAggregate]:
+        sql = f"SELECT * FROM edge_agg WHERE {where} ORDER BY observations DESC," \
+              " callee_cls, callee_idx, caller_cls, caller_idx"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args = (*args, limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [
+            EdgeAggregate(
+                build_sha=str(r["build_sha"]),
+                caller_cls=str(r["caller_cls"]),
+                caller_idx=int(r["caller_idx"]),
+                callee_cls=str(r["callee_cls"]),
+                callee_idx=int(r["callee_idx"]),
+                sampled_observations=int(r["observations"]),
+                windows=int(r["windows"]),
+                first_seen=from_epoch_ms(int(r["first_seen_ms"])),
+                last_seen=from_epoch_ms(int(r["last_seen_ms"])),
+                sample_rate_min=int(r["sample_rate_min"]),
+                sample_rate_max=int(r["sample_rate_max"]),
+            )
+            for r in rows
+        ]
+
+    def _bump_sample_rate(self, build_sha: str, rate: int) -> None:
+        self._conn.execute(
+            "INSERT INTO edge_sample_rates (build_sha, sample_rate, windows)"
+            " VALUES (?,?,1) ON CONFLICT(build_sha, sample_rate)"
+            " DO UPDATE SET windows=windows+1",
+            (build_sha, int(rate or 0)),
+        )
+
+    def _latest_window_id(self, w: IngestWindow) -> int:
+        row = self._conn.execute(
+            "SELECT MAX(window_id) AS id FROM windows WHERE build_sha=? AND instance_id=?"
+            " AND window_start_ms=? AND window_end_ms=?",
+            (w.build_sha, w.instance_id, w.window_start_ms, w.window_end_ms),
+        ).fetchone()
+        # 0 = "no window row" -- edges recorded without their window. The
+        # aggregate is still correct; only the per-window audit trail is thin.
+        return int(row["id"] or 0) if row else 0
 
     # -- IngestAudit -----------------------------------------------------
 
@@ -415,6 +765,8 @@ class SqliteStore(Store, WindowAttribution, IngestAudit):
             clock_degraded=bool(health_raw.get("clockDegraded", False)),
             degraded=bool(health_raw.get("degraded", False)),
             raw=health_raw,
+            edges=_edge_health(health_raw),
+            strip_mask_missing=_int(health_raw, "stripMaskMissing"),
         )
         return Window(
             window_id=int(row["window_id"]),

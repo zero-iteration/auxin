@@ -15,6 +15,21 @@ public class NegativeApp {
             // the contract is drop-and-count, never block, never allocate, never throw
             for (int i = 0; i < 400000; i++) t.boundary(0);
         }
+        if (args.length > 0 && "edgefail".equals(args[0])) {
+            // Take the fail-open path deliberately, then keep using the application. The tier
+            // must be off, counted, and NOT have dragged coverage or tier-2 down with it.
+            EdgeTarget before = new EdgeTarget();
+            System.out.println("EDGEFAIL_BEFORE=" + before.root(3));
+            AuxinAgent.edgesForceFailOpen("negative-suite fail-open drill");
+            System.out.println("EDGEFAIL_AFTER=" + before.root(3));
+        }
+        if (args.length > 0 && "edgeflood".equals(args[0])) {
+            // the same contract for the edge ring, which is a second Ring and therefore has its
+            // own drop accounting: a burst of edges must never evict a tier-2 event, and must
+            // never block the application thread that produced it
+            EdgeTarget fan = new EdgeTarget();
+            for (int i = 0; i < 200; i++) fan.fanRoot(200);
+        }
         boolean ok = t.alpha(10) == -5
                 && t.gamma(2.0d) == 10.0d
                 && "many:5".equals(t.beta("hello"))
@@ -26,13 +41,37 @@ public class NegativeApp {
                 // instrumented or vetoed, they must always still WORK.
                 && new io.auxin.userapp.Thing().work(4) == 13
                 && new com.datadog.trace.CustomerCode().handle(4) == 7
+                // SCOPE-v3: the call-edge tier changes nothing the application can observe,
+                // whether it is on, off, misconfigured, or has failed itself open.
+                && new EdgeTarget().root(3) == 18
+                && new EdgeTarget().outerRoot(3) == 19
+                && edgeThrowStillThrows()
+                && AuxinAgent.edgeActiveTraces() == 0
                 && isolatedStillWorks();
         System.out.println("APP_OK=" + ok);
         System.out.println("ACTIVE=" + AuxinAgent.active());
         System.out.println("BRIDGE=" + AuxinAgent.bridgeStatus());
         System.out.println("INSTRUMENTED=" + (AuxinAgent.probes("smoke.SmokeTarget") != null));
+        System.out.println("EDGES=" + AuxinAgent.edgesEnabled());
+        System.out.println("EDGETRACES=" + AuxinAgent.edgeActiveTraces());
         System.out.println("FLUSH=" + AuxinAgent.flushNow());
         Runtime.getRuntime().halt(ok ? 0 : 1);
+    }
+
+    /**
+     * An exception leaving a boundary method must still leave it, unchanged, through the edge
+     * tier's own handler — and must leave no trace open behind it.
+     */
+    private static boolean edgeThrowStillThrows() {
+        try {
+            new EdgeTarget().throwingRoot(7);
+            return false;
+        } catch (IllegalStateException expected) {
+            return "edge-7".equals(expected.getMessage());
+        } catch (Throwable wrong) {
+            System.out.println("EDGE_WRONG_THROWABLE=" + wrong);
+            return false;
+        }
     }
 
     /**

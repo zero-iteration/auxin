@@ -40,7 +40,15 @@ TEST_ENTRY_POINT_KINDS: frozenset[str] = frozenset(
 )
 
 _RESOLUTIONS = frozenset({"exact", "cha", "unresolved"})
-_SEMANTICS = frozenset({"blocking", "no-op", "transitive"})
+_SEMANTICS = frozenset({"blocking", "noop", "no-op", "transitive"})
+"""Edge semantics this reader accepts.
+
+BUG #22: ax-static emits `noop` (and CONTRACTS S1 specifies `blocking | noop`) while this set
+held only `no-op`/`blocking`/`transitive`, so the real server refused to LOAD the real manifest
+with a ManifestError at startup -- found within 30 seconds of first connecting the two. `no-op`
+and `transitive` are kept as tolerated aliases (transitive is SCARF's third class, C52) so a
+producer on either spelling is never a hard startup failure; the canonical value is `noop`.
+"""
 
 
 class ManifestError(ValueError):

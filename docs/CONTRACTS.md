@@ -1,6 +1,10 @@
 # Module contracts — frozen interfaces
 
-**Contract version 2** (was 1). Breaking changes in v2: §2 gained the C50 liveness gate and
+**Contract version 3** (was 2). v3 is **additive only**: §2 gained `edges[]` and the
+`agentHealth.edges*` counters for the SCOPE-v3 sampled runtime call-edge tier. Readers of v2 stay
+correct — they ignore unknown keys and see an empty call graph — so the **wire `schemaVersion`
+deliberately stays 2** (see the end of §2 for why bumping it would be the breaking change, not
+the fix). Breaking changes in v2, for the record: §2 gained the C50 liveness gate and
 `coverage[].frames`; §4 gained `NOT_DYNAMICALLY_OBSERVABLE`, `eligibility`, and the C53 proposal
 fields. Agents implementing v1 must be updated.
 
@@ -30,6 +34,7 @@ File: `auxin-manifest.json`. Emitted at build time. Shipped alongside the agent.
       "methods": [
         { "idx": 0, "name": "pick", "desc": "(Ljava/util/List;)Lcom/acme/Rate;",
           "line": 47, "access": "public", "synthetic": false, "tier2": true,
+          "tier2Reason": "entryPoint:GetMapping",
           "dynamicallyObservable": true, "sccId": 91, "testOnlyReachable": false,
           "shortCircuitable": false }
       ]
@@ -76,6 +81,24 @@ File: `auxin-manifest.json`. Emitted at build time. Shipped alongside the agent.
 - `testOnlyReachable` (C50) via Tarjan SCC over the call graph: true when a method's only non-test
   inbound edges lie inside its own library<->test SCC. **`null` = undecidable. Never emit `false`
   when unsure.**
+- **`tier2` is populated by ax-static, not hand-maintained.** Two selection paths, and the
+  boundary one needs no configuration: (a) **every detected entry point** -- the `entryPoints[]`
+  methods are the boundary, and under SCOPE-v3 this scan is the only source of TPS/rate/latency
+  that will exist; (b) `--tier2 <glob>` over `fully.qualified.Class#method` (`*` within a package
+  segment, `**` across), with `--tier2-exclude <glob>` applied after the includes and after the
+  automatic entry points. A method is **never** tier-2 when it is not probeable (synthetic, bridge,
+  `<clinit>`, abstract, native), when `dynamicallyObservable` is `false` (timing what cannot be
+  covered is cost with no signal), or when its class `isTest`. `shortCircuitable: true` is
+  **not** a bar -- that rule forbids a dead-code verdict, not a timing. Selection larger than
+  `--tier2-max` (default 250; PLAN-v2 sizes the allowlist at ~50-200) **fails the scan with exit 3**
+  and is never truncated: tier-2 costs ~80ns per call per method and that number must be chosen by
+  a human.
+- **`tier2Reason`** (additive, **no schema bump**): a string saying *why* a method is timed --
+  `entryPoint:<kind>` (the kind written on the method wins over one propagated from its type) or
+  `pattern:<the --tier2 glob, verbatim>`. **An absent value means not tier-2.** It is advisory
+  provenance for a human reading a latency graph months later; `tier2` remains the only field a
+  reader may act on, and the two always agree. Readers ignore unknown keys (see `ManifestReader`),
+  so a producer that does not emit it stays valid.
 
 ---
 
@@ -85,7 +108,7 @@ File: `auxin-manifest.json`. Emitted at build time. Shipped alongside the agent.
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "buildSha": "abc123def",
   "artifact": "checkout-service",
   "instanceId": "pod-7f3a",
@@ -100,9 +123,31 @@ File: `auxin-manifest.json`. Emitted at build time. Shipped alongside the agent.
                   "probes": "AQAB" } ],
   "tier2": [ { "class": "...", "idx": 0, "calls": 1201, "errors": 3,
                "errorTypes": {"java.net.SocketTimeoutException": 3},
-               "buckets": [0,0,14,881,306,0] , "bucketScheme": "loglinear-16-v1" } ]
+               "buckets": [0,0,14,881,306,0] , "bucketScheme": "loglinear-16-v1" } ],
+  "edges": [ { "fromClass": "com.acme.web.RateController", "fromIdx": 2,
+               "toClass": "com.acme.shipping.RateSelector", "toIdx": 0, "count": 17 } ]
 }
 ```
+
+- **`coverage[].probesInstalled`** (contract v3, additive, always present) — base64 bitset, same
+  packing as `probes`, marking the indices where a probe was **actually installed in this JVM**.
+  BUG #18: the probe array is sized to the manifest's `probeCount` (every probe-*eligible* method),
+  but the emitter installs at only some indices. An index with no probe is **never written by
+  anything**, so its bit is permanently zero — and it was shipped next to genuinely-zero bits as
+  evidence a method never ran. Some skips are recoverable from the manifest
+  (`dynamicallyObservable == false`), but the runtime-only ones are **not expressible in a
+  manifest**: `frameEmissionUnsupported` is a per-JVM bytecode decision, and with
+  `ax.tier1.enabled=false` every bitset is all-zero while every method stays observable — so a
+  window from a tier-1-disabled JVM read as *"every method in your codebase is dead."*
+
+  **>>> THE READING RULE:**
+  ```
+  probes                      -> liveness   (a set bit means it ran)
+  probesInstalled & ~probes   -> the ONLY death evidence
+  ~probesInstalled            -> SILENCE. Not evidence of anything.
+  ```
+  When the agent cannot determine the mask it ships an **all-zero** mask — losing a candidate,
+  never inventing one. Preserve that bias. `agentHealth.stripMaskMissing` counts those cases.
 
 - `probes` is base64 of the packed bitset, LSB = idx 0. **Accumulated, never reset** — the
   collector computes deltas.
@@ -119,6 +164,67 @@ File: `auxin-manifest.json`. Emitted at build time. Shipped alongside the agent.
   ingest and counted** — never used as evidence that code is alive. Without this the product
   inverts: every *tested* method looks alive forever, so only *untested* code could ever be deleted.
 - **Never send a percentile.** Buckets only; percentiles are computed in `gt-collector` (C31).
+
+### `edges[]` — the sampled runtime call-edge tier (SCOPE-v3, additive)
+
+Runtime caller->callee edges, **sampled once per entry into a tier-2 boundary method** and
+aggregated on the drain thread. SCOPE-v3 removed "use OTel spans" as an answer to "what calls
+what", so the agent now produces this itself; it is a single-process call graph and nothing else
+(cross-process topology stays out of scope — context propagation needs a per-request allocation).
+
+- **Both ends are identified exactly as `tier2[]` identifies its method**: `(class, idx)` from the
+  build-time manifest. Never an agent-internal id, never a name+descriptor string.
+- `count` is a **raw count of observations in sampled traces** in this window, additive across
+  windows and pods. It is NOT a call count: multiply by `agentHealth.edgesSampleRate` for an
+  estimate, and never present it as exact. No percentiles, no rates, no ratios (C31).
+- The array is **always present**, and empty when the tier is off. An absent key and an empty
+  graph are different facts.
+- An edge is evidence of **liveness only**, and only under the same C50 gate as everything else in
+  the window. Its absence is **never** evidence of death: it is sampled, depth-bounded,
+  per-root-bounded and drop-on-full, every one of which is counted below. `edges[]` must never
+  feed a `DEAD_CANDIDATE` verdict — it corroborates a live path, which is section 4's
+  `static_reachable`-style role, not a substitute for a probe.
+- Methods marked `dynamicallyObservable: false` (C51) carry no edge instrumentation, so a chain
+  through a constant-returning accessor shows as a gap rather than as an edge.
+
+New `agentHealth` counters (all raw counts, cumulative for the JVM like `ringDropped`, except
+`edgesEnabled`/`edgesSampleRate` which describe the configuration the counts were produced under):
+
+| field | meaning |
+|---|---|
+| `edgesEnabled` | the tier is armed in this JVM. **Default false** — absence of edges from a window with `false` here is a configuration fact, not an observation |
+| `edgesSampleRate` | 1-in-N root entries traced (power of two; 1024 by default). **The counts in `edges[]` are uninterpretable without it** |
+| `edgesSampledRoots` | root invocations actually sampled: the denominator |
+| `edgesRecorded` | edge events folded into the aggregator |
+| `edgesDropped` | edge events the ring rejected (drop-on-full, C27) |
+| `edgesTruncatedDepth` | sampled root invocations that hit `ax.edges.max.depth`, one per invocation |
+| `edgesTruncatedRoot` | sampled root invocations that hit `ax.edges.max.per.root`, one per invocation |
+| `edgesTruncatedDistinct` | distinct edges refused because `ax.edges.max.distinct` was reached |
+| `edgeTierFailures` | the tier latched itself off after an unexpected Throwable. **Deliberately not `degraded`**: coverage and tier-2 in the same window are still valid evidence |
+| `edgeTracesReaped` | a trace gate was reset because it stayed up with no new edge. Non-zero means a trace was never closed |
+
+### >>> BUG #17: this section's own example said 1 while its prose said 2
+The agent has emitted `WIRE_SCHEMA_VERSION = 2` since the C50 liveness fields landed. The
+collector's constant said **1** and `decode.py` refused anything `!= SCHEMA_VERSION`, so **every
+window from the real agent was rejected by the real collector** — 100% data loss, reported as a
+schema mismatch.
+
+Neither side's tests caught it. The agent's smoke suite flushes to a throwaway HTTP listener that
+accepts any body; the server's 250 tests used fixtures hardcoded to `1`, and one of them *pinned
+`2` as a rejection* — encoding the break as correct behaviour. **Two components, each verified
+against a stand-in for the other.**
+
+Fixed: the collector now holds `SUPPORTED_SCHEMA_VERSIONS = {1, 2}` — a **set**, not a single
+constant, because every addition so far has been purely additive and a reader that ignores unknown
+keys decodes both. The refusal itself stays and still matters: an **unknown** version may carry a
+different probe-index assignment (A14 defect 2), and accepting that silently is exactly how
+coverage gets attributed to the wrong methods. Regression test pins both readable versions.
+
+**`schemaVersion` is 2.** `edges[]` and the counters above are purely additive and a v2 reader
+ignores unknown keys, while the collector refuses any `schemaVersion` it does not recognise
+exactly (`decode.py`: *"schemaVersion N != 2; refusing to merge"*). Bumping the wire version to
+announce an additive field would make every deployed collector drop every window — including its
+coverage. The **contract document** version is bumped instead; that is what version 3 records.
 
 ---
 
@@ -137,6 +243,16 @@ class Store(ABC):
     def class_loaded_ever(self, build_sha: str, cls: str) -> bool: ...
     def tier2_buckets(self, build_sha: str, cls: str, idx: int, since: datetime) -> list[int]: ...
 ```
+
+### Optional port extensions
+`Store`'s eight abstract methods above are **frozen** (a test asserts the set is exactly this).
+Capabilities added since are separate ABCs, feature-detected with `isinstance`:
+`WindowAttribution`, `IngestAudit`, and **`EdgeStore`** (runtime call edges: `window_edges`,
+`edge_agg`, `edge_sample_rates`, callers-of / callees-of).
+
+**Edge counts merge ADDITIVELY. Coverage merges as an idempotent OR.** Do not conflate them —
+replaying one identical window must double the edge counts and leave the coverage bitset
+untouched, and a test pins exactly that.
 
 `merge_coverage` is **bitwise OR, never overwrite**. Mismatched `schema_hash` raises
 `SchemaMismatch` — it must not silently merge or silently report zero.

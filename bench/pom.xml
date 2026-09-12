@@ -40,6 +40,19 @@
       <artifactId>asm-tree</artifactId>
       <version>${asm.version}</version>
     </dependency>
+
+    <!-- G6 measures the SHIPPED agent runtime, not a copy of it in this module: the arms call
+         the real io.auxin.agent.runtime.EdgeRuntime out of the built jar, so whatever HotSpot
+         decides about inlining it is what the gate reports. Consequence: ax-agent must be
+         packaged first (bench/run-gates.sh g6 checks, and says so if it is missing). System
+         scope keeps it out of the shaded jar, so the runner puts both jars on -cp. -->
+    <dependency>
+      <groupId>io.auxin</groupId>
+      <artifactId>ax-agent</artifactId>
+      <version>0.1.0-SNAPSHOT</version>
+      <scope>system</scope>
+      <systemPath>${project.basedir}/../modules/ax-agent/target/ax-agent.jar</systemPath>
+    </dependency>
   </dependencies>
 
   <build>

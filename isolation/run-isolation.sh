@@ -133,10 +133,28 @@ MF
       cp "$d/$f" "$BUILD/allclasses/$f"
     done < <(cd "$d" && find . -name '*.class' ! -name 'module-info.class' | sed 's|^\./||')
   done
-  # one tier-2 method, so the suite can also show what the bridge CANNOT carry
-  "$JAVA" -cp "$AGENT" io.auxin.agent.manifest.ManifestTool \
-      "$BUILD/allclasses" "$BUILD/manifest.json" --artifact=isolation --buildSha=iso001 \
-      "--tier2=iso.osgi.Service#alpha" || exit 2
+  # one tier-2 method, so the suite can also show what the bridge CANNOT carry.
+  #
+  # Uses the REAL ax-static, not the old in-agent ManifestTool (deleted): the agent must be
+  # exercised against the generator that will actually produce its manifests in production.
+  # Testing each component against a stand-in for the other is precisely how the schemaVersion
+  # break (bug #17) survived two green suites.
+  #
+  # ax-static targets JDK 17 while this suite runs under 11/17/21. The manifest is just JSON, so
+  # the generator's JDK is independent of the JVM under test -- run it with a 17+ explicitly.
+  local AX_STATIC="$ROOT/modules/ax-static/target/ax-static.jar"
+  if [ ! -f "$AX_STATIC" ]; then
+    echo "FATAL: ax-static.jar not found at $AX_STATIC" >&2
+    echo "       build it first:  (cd modules/ax-static && mvn -o clean package)" >&2
+    exit 2
+  fi
+  local AX_STATIC_JAVA="${AX_STATIC_JAVA:-/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home/bin/java}"
+  [ -x "$AX_STATIC_JAVA" ] || AX_STATIC_JAVA="$JAVA"
+  "$AX_STATIC_JAVA" -jar "$AX_STATIC" \
+      --input "$BUILD/allclasses" \
+      --build-sha iso001 --artifact isolation \
+      --output "$BUILD/manifest.json" \
+      --tier2 'iso.osgi.Service#alpha' || exit 2
 }
 
 # ------------------------------------------------------- assertion helpers ----

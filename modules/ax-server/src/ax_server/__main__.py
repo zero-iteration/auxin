@@ -7,6 +7,7 @@ from ax_server.analysis.engine import AnalysisConfig, AnalysisEngine
 from ax_server.analysis.manifest import load_manifest
 from ax_server.analysis.phases import PhaseCalendar
 from ax_server.analysis.proposals import SqliteProposalLedger
+from ax_server.analysis.runtime_edges import manifest_method_index
 from ax_server.analysis.suppression import Suppressions
 from ax_server.api.http import make_api_router
 from ax_server.api.service import QueryService
@@ -28,10 +29,14 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 
     store = SqliteStore(args.db)
-    collector = CollectorService(store)
+    manifest = load_manifest(args.manifest)
+    # The collector validates every `edges[]` endpoint against the manifest
+    # that was actually shipped, so a dangling (class, idx) is refused at
+    # ingest instead of becoming an unresolvable row.
+    collector = CollectorService(store, known_methods=manifest_method_index(manifest))
     engine = AnalysisEngine(
         store,
-        load_manifest(args.manifest),
+        manifest,
         config=AnalysisConfig(phase_calendar=PhaseCalendar.from_file(args.phases)),
         suppressions=Suppressions.from_file(args.suppress),
         ledger=SqliteProposalLedger(args.db + ".proposals"),

@@ -48,9 +48,10 @@ public final class ManifestReader {
         Map<String, Object> obj = asObject(root, "<root>");
 
         int schemaVersion = (int) requireLong(obj, "schemaVersion", "<root>");
-        if (schemaVersion != Manifest.SCHEMA_VERSION) {
+        if (!Manifest.READABLE_SCHEMA_VERSIONS.contains(Integer.valueOf(schemaVersion))) {
             throw new ManifestFormatException("unsupported schemaVersion " + schemaVersion
-                    + "; this build of ax-manifest only understands " + Manifest.SCHEMA_VERSION);
+                    + "; this build of ax-manifest reads " + Manifest.READABLE_SCHEMA_VERSIONS
+                    + " and writes " + Manifest.SCHEMA_VERSION);
         }
 
         List<ClassEntry> classes = new ArrayList<ClassEntry>();

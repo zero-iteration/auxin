@@ -1,4 +1,4 @@
-# auxin — benchmark gates G1–G4, measured results
+# auxin — benchmark gates G1–G4 and G6, measured results
 
 Run date: 2026-09-12. Harness: `bench/`, driver `./run-gates.sh`, raw output in `bench/results/`.
 
@@ -404,6 +404,100 @@ substitute.
 
 ---
 
+## G6 — the sampled runtime call-edge tier *(SCOPE-v3)*
+
+### What is being measured
+
+A generated class with `work(int)` plus 8 small leaf methods. `work()` is a **tier-2 boundary
+method, i.e. a sampling root**; the leaves are callees. So **9 instrumented methods and 18 call
+sites per op**, the same shape G1 used, and the arms call **the real
+`io.auxin.agent.runtime.EdgeRuntime` out of the shipped agent jar** rather than a copy in the
+bench module — whatever HotSpot decides about inlining it is what these numbers contain.
+
+`ax.bench.g6.EdgeSelfCheck` runs first and asserts that each arm records exactly the edges its
+name claims (0 / 0 / 0 / 0 / 32768 / 32 / 0 for 4096 ops). A benchmark of instrumentation that
+silently records nothing would report precisely the number we want to see.
+
+```
+arm                        rate              edges   expected
+NONE (control)             1-in-1                0          0  PASS
+EDGES, tier off            1-in-1024             0          0  PASS
+EDGES, never sampled       never                 0          0  PASS
+ROOT_ONLY, never sampled   never                 0          0  PASS
+EDGES, every root          1-in-1            32768      32768  PASS
+EDGES, 1-in-1024           1-in-1024            32         32  PASS
+CALLEES_ONLY, foreign trace 1-in-1               0          0  PASS
+```
+
+### ns/op, 9 instrumented methods / 18 call sites per op
+
+| arm | t=1 | t=4 | **t=10** |
+|---|---|---|---|
+| **a0** uninstrumented (control) | 7.316 ± 0.112 | 8.051 ± 0.042 | 9.484 ± 0.020 |
+| **a1** calls in the bytecode, **tier off** (the default) | 7.522 ± 0.038 | 7.911 ± 0.308 | 10.419 ± 0.100 |
+| **a2** tier ON, **this root not sampled** | 7.564 ± 0.035 | 8.875 ± 0.096 | 12.548 ± 0.207 |
+| **a3** root instrumented only, not sampled | 7.543 ± 0.022 | 7.872 ± 0.134 | 9.779 ± 0.051 |
+| **a4** every root sampled (stress, not a config) | 55.393 ± 0.440 | 686.624 ± 12.184 | 1921.877 ± 39.201 |
+| **a5** the default **1-in-1024** | 8.082 ± 0.825 | 11.090 ± 0.227 | 22.551 ± 1.632 |
+| **a6** another thread is inside a trace | 11.737 ± 0.197 | 17.804 ± 0.214 | 37.552 ± 1.925 |
+
+Derived:
+
+| quantity | t=1 | t=4 | t=10 |
+|---|---|---|---|
+| **unsampled, per instrumented method** (a2−a0)/9 | **0.028 ns** | **0.092 ns** | **0.340 ns** |
+| unsampled, per call site (a2−a0)/18 | 0.014 ns | 0.046 ns | 0.170 ns |
+| gate only, tier off (a1−a0)/9 | 0.023 ns | ~0 (−0.016) | 0.104 ns |
+| the root's sampling decision (a3−a0), per root entry | +0.227 ns | ~0 (−0.179) | +0.295 ns |
+| **per edge actually recorded** (a4−a0)/8 | **6.0 ns** | 84.8 ns | 239.0 ns |
+| **effective overhead at 1-in-1024** (a5−a0) | **+0.77 ns/op (+10.5%)** | +3.04 (+37.8%) | +13.07 (+137.8%) |
+| while another thread traces, per call site (a6−a0)/18 | 0.246 ns | 0.542 ns | 1.559 ns |
+
+**Allocation (`-prof gc`, t=4):** control `≈10⁻⁴ B/op`, unsampled `≈10⁻⁴ B/op`, **every-root
+sampled `0.023 ± 0.668 B/op`**. Zero per-call allocation on both paths, measured, not asserted —
+the per-thread `State` + `int[]` is one allocation per thread for the life of the thread.
+
+**Ring behaviour, printed per trial so a saturated measurement cannot masquerade as a fast one:**
+at t=1 the sampled arm drained **1.02 billion edges with `droppedFull=0` and
+`droppedContended=0`** — the 6.0 ns/edge figure was measured against a ring that never filled. At
+t=4 and t=10 the same arm shows 3–7% `droppedContended` (a failed CAS is a drop by design, C27)
+and still no `droppedFull`.
+
+### Reading these numbers
+
+1. **The unsampled path is the decision, and it is effectively zero**: 0.028 ns per instrumented
+   method at one thread, 0.34 ns at ten. For scale, G1 measured the **tier-1 blind probe** at
+   **+0.72–0.77 ns/probe at ten threads** and rejected it for that. The edge tier's unsampled cost
+   is under half of what was already judged too expensive, and unlike tier-1 it is **off by
+   default**.
+2. **The t=10 figure is not all gate.** a1 (identical bytecode, tier off, gate still read on every
+   call) already costs +0.935 ns/op there, so most of it is two extra call sites per method —
+   code size and inlining, the G2 effect — not the volatile load. On a 10-thread run of a 9 ns op
+   this is measurable; it is also the regime where the harness itself is least trustworthy (10
+   measured threads on 10 logical cores).
+3. **`a4` is a stress arm, not a configuration.** Sampling every root entry at 145 M edges/s is
+   three orders of magnitude past what 1-in-1024 does to a real boundary method, and its t=4/t=10
+   degradation is A7's MPSC contention curve (14.6 ns/op 1P1C → 189 ns/op 6P6C) reproducing itself,
+   not something new.
+4. **The +137.8% at t=10 and 1-in-1024 is real and misleading, in that order.** The denominator is
+   a synthetic root that costs **9.5 ns**; a real tier-2 boundary method is a request handler
+   costing microseconds to milliseconds. The transferable form of that row is the **absolute**
+   one: +13 ns per op covering 9 instrumented calls, of which ~1.9 ns is the 1/1024 sampled trace
+   itself and the rest is the gate being up for other threads while it runs.
+5. **The one genuine design cost to disclose is a6.** While *any* thread is inside a sampled
+   trace, *every other* thread's `enter`/`exit` falls through the gate into a `ThreadLocal` read
+   that finds nothing: 0.25 ns per call site at one thread, 1.56 ns at ten. At 1-in-1024 with
+   short traces the gate is down almost always (a5 is the composite), but a deployment with many
+   threads and long traces would sit closer to a6 than to a2. That is the number to re-measure on
+   x86_64 Linux before widening the rate.
+
+Same architecture hazard as every other gate here: **aarch64, and the gate is a shared `volatile
+int` that is written when a trace starts and ends.** On x86_64 a volatile int read is a plain
+`mov`; on aarch64 it is an `ldar`. If anything these numbers are pessimistic, but "if anything" is
+not a measurement.
+
+---
+
 ## Summary table
 
 | gate | status | headline |
@@ -412,7 +506,8 @@ substitute.
 | **G2** | **RUN** | **0 lost inlines at hot call sites** (C2's `FreqInlineSize=325` absorbs the probe) but **+29.6 %** throughput. With the frequency exemption removed, **2 methods stop inlining** (`Mixer::mix` 31→39, `Engine::pad` 29→38) and the penalty rises to **+47.7 %**. 11 of 32 methods cross `MaxTrivialSize=6`. |
 | **G3** | **PASS on JDK 17 only** | 26/26 assertions. Install → correct probes flip → retransform-strip → post-strip call records nothing → all methods work → **no field or method added or removed**. Bonus: the `CHECKCAST` workaround is unnecessary on 17. |
 | **G4** | **RUN — partial** | Name-only matching: **+0.2 % wall**. Full instrumentation of 50k methods: **+120 ms wall / +539 ms CPU (+161 %)**. Parsing-to-decide costs **+254 ms CPU** more. **4.5× CPU/wall ratio ⇒ a 1-CPU pod would feel the CPU figure, not the wall figure.** |
-| **G5** | **NOT BUILT** | Out of scope for this task. |
+| **G5** | **NOT BUILT** | Out of scope for this task. (Built since, in `g5/`: 972 assertions.) |
+| **G6** | **RUN — the unsampled path is effectively zero** | **0.028 ns per instrumented method at 1 thread, 0.34 ns at 10** (vs the +0.72–0.77 ns/probe that got G1's blind store rejected), **0 B/op allocated on both the unsampled and the sampled path**, **6.0 ns per edge recorded** with an unsaturated ring. Effective overhead at the default 1-in-1024: **+0.77 ns/op (+10.5%) at 1 thread, +13.1 ns (+138%) at 10** — against a synthetic 9.5 ns root, so read the absolute figure, not the percentage. Cost to disclose: while any thread traces, every other thread pays 0.25–1.56 ns per call site. |
 
 ---
 
@@ -453,8 +548,11 @@ substitute.
 ```bash
 cd bench
 JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home mvn -q clean package
-./run-gates.sh            # all four gates, ~9 minutes
-./run-gates.sh g1         # or one at a time: g1 | g2 | g3 | g4
+./run-gates.sh            # all five gates, ~22 minutes (G6 is ~13 of them)
+# G6 measures the SHIPPED agent runtime, so build it first:
+#   mvn -q -f ../modules/ax-agent/pom.xml clean package
+./run-gates.sh g6         # the call-edge tier alone: self-check, 1/4/10 threads, -prof gc
+./run-gates.sh g1         # or one at a time: g1 | g2 | g3 | g4 | g6
 
 AX_BENCH_JDKS=/jdk11:/jdk17:/jdk21 ./run-gates.sh g3   # multi-JDK G3
 GT_BENCH_THREADS="1 4 32" ./run-gates.sh g1            # override thread counts

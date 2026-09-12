@@ -102,7 +102,19 @@ def check_gt(run, gt_json, manifest, expect_zero):
     good &= ok(h["transformFailures"] == 0, "GT.transformFailures", h["transformFailures"])
     good &= ok(h.get("degraded") is False, "GT.notDegraded", h.get("degradedReason", ""))
     allowed = {"noManifestEntry", "notDynamicallyObservable"}
-    unexpected = {k: v for k, v in h["classesSkipped"].items() if k not in allowed}
+    skipped = dict(h["classesSkipped"])
+    # `noEligibleMethods` is allowed, but ONLY as many times as the manifest actually contains a
+    # class with nothing to probe. The real generator (ax-static) inventories a pure interface --
+    # `io.auxin.demo.repo.Repository` -- with probeCount 0, where the previous in-agent stand-in
+    # omitted such classes entirely and the agent reported the much vaguer `noManifestEntry`
+    # instead. This is the better of the two: "the build knew about this class and there was
+    # nothing in it to probe" is benign, whereas "the build has never heard of this class" is an
+    # alarm. Bounded by count, so a real regression -- the agent finding a class empty that the
+    # build says carries probes -- still fails here rather than hiding behind the reason name.
+    if skipped.get("noEligibleMethods", 0) <= sum(
+            1 for c in manifest["classes"] if c["probeCount"] == 0):
+        skipped.pop("noEligibleMethods", None)
+    unexpected = {k: v for k, v in skipped.items() if k not in allowed}
     good &= ok(not unexpected, "GT.noUnexpectedSkips", json.dumps(h["classesSkipped"]))
     good &= ok(h.get("livenessEvidence") is True, "GT.livenessEvidence",
                "environment=%s" % h.get("environment"))
@@ -449,8 +461,8 @@ def check_tier1b(run, obs_present, expect_noop):
                    % t.get("A1.stripNowReturned"))
     good &= ok(t.get("A1.stripFailures", 1) == 0, "T1B.noStripFailures",
                t.get("A1.stripFailures"))
-    good &= ok(t.get("A2.name.callable") is True, "T1B.classStillWorksAfterStrip",
-               "Customer.name() still returns the right value")
+    good &= ok(t.get("A2.anonymize.callable") is True, "T1B.classStillWorksAfterStrip",
+               "Customer.anonymize() still returns a correct Customer after the strip")
 
     if expect_noop:
         # --- G5-BUG-3. When ax-agent is registered BEFORE another incapable transformer,
@@ -460,7 +472,7 @@ def check_tier1b(run, obs_present, expect_noop):
         ok(t.get("A2.stripEffective") is False, "G5-BUG-3.tier1bSilentNoOpReproduced",
            "strip reported success (stripNow=true, stripFailures=0, classesStripped+1) "
            "but the probe still fires: probeAfterCall=%s"
-           % t.get("A2.name.probeAfterCall"))
+           % t.get("A2.anonymize.probeAfterCall"))
         emit("INFO", "G5-BUG-3.classesStrippedMetricOverstated",
              "health.classesStripped=%s while at least one of those strips changed nothing"
              % t.get("health.classesStripped"))

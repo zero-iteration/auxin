@@ -141,6 +141,26 @@ def test_http_rejects_an_unclassified_jvm_with_403(server):
     assert json.loads(exc.value.read())["error"] == "not_production_classified"
 
 
+def test_http_instrumentation_gaps_route(server):
+    """Bug #18 over HTTP: ingest a post-#18 window, then ask what could have
+    been observed at all."""
+    from conftest import realistic_payload_installed
+
+    req = urllib.request.Request(
+        server + "/v1/ingest",
+        data=json.dumps(realistic_payload_installed(0)).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        assert json.loads(resp.read())["installMasksMerged"] == 6
+
+    status, gaps = _get(server, f"/v1/builds/{BUILD_SHA}/instrumentation-gaps")
+    assert status == 200
+    assert gaps["maskReported"] is True
+    assert gaps["observableButNeverInstrumented"] == 0
+    assert gaps["installedIndices"] == 9
+
+
 def test_http_unknown_route_is_404(server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(server + "/nope", timeout=10)

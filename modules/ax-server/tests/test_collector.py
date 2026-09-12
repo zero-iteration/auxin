@@ -42,8 +42,12 @@ def test_corrupt_gzip_is_rejected(collector):
 
 
 def test_schema_version_mismatch_is_rejected_loudly(collector, caplog):
+    """An UNKNOWN wire version is refused. Bug #17: this test used to use 2 -- the very version
+    the real agent sends -- so it pinned a total pipeline break as correct behaviour. 99 is used
+    now because the point of the refusal is that an unknown version may carry a different
+    probe-index assignment (A14 defect 2), not that the number is large."""
     body = realistic_payload(0)
-    body["schemaVersion"] = 2
+    body["schemaVersion"] = 99
     with caplog.at_level("ERROR"):
         with pytest.raises(IngestRejected) as exc:
             collector.ingest(body)
@@ -131,3 +135,16 @@ def test_merge_across_pods_is_order_independent(store):
     a.ingest(p1)
     a.ingest(p2)
     assert sorted(set_bits(store.coverage(BUILD_SHA, CLS))) == [0, 2]
+
+
+def test_the_version_the_real_agent_actually_sends_is_accepted(collector):
+    """Bug #17 regression. The agent's WIRE_SCHEMA_VERSION has been 2 since the C50 liveness
+    fields landed; the collector accepted only 1, so every real window was rejected. Neither
+    side's suite caught it -- the agent flushes to a throwaway listener that accepts anything,
+    and these fixtures were hardcoded to 1. Pin BOTH readable versions here so the two
+    components cannot drift apart again without a red test."""
+    for version in (1, 2):
+        body = realistic_payload(0)
+        body["schemaVersion"] = version
+        ack = collector.ingest(body)
+        assert ack is not None, f"schemaVersion {version} must be readable"

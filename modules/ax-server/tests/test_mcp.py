@@ -51,7 +51,15 @@ def test_tools_list_exposes_the_query_surface(mcp):
         "gt_coverage_windows",
         "gt_summary",
         "gt_proposals",
+        # Bug #18: the deliberate edit this exact-set assertion asks for.
+        "gt_instrumentation_gaps",
         "gt_effective_false_positives",
+        # SCOPE-v3 runtime call graph. Still an EXACT set: a tool added
+        # without a deliberate edit here still fails this test.
+        "gt_callers_of",
+        "gt_callees_of",
+        "gt_blast_radius",
+        "gt_hot_paths",
     }
 
 

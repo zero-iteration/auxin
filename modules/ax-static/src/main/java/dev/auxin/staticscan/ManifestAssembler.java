@@ -23,6 +23,8 @@ import dev.auxin.staticscan.scan.GeneratedClassFilter;
 import dev.auxin.staticscan.scan.InventoryScanner;
 import dev.auxin.staticscan.scan.MethodCandidateFactory;
 import dev.auxin.staticscan.source.ClassSource;
+import dev.auxin.staticscan.tier2.Tier2Selection;
+import dev.auxin.staticscan.tier2.Tier2Selector;
 import dev.auxin.staticscan.source.ClassSourceVisitor;
 
 import java.io.IOException;
@@ -52,16 +54,25 @@ import java.util.TreeSet;
  */
 public final class ManifestAssembler {
 
-    /** Result of one scan: the manifest plus the counters an operator needs to trust it. */
+    /**
+     * Result of one scan: the manifest plus the counters an operator needs to trust it.
+     *
+     * <p>{@code tier2} rides alongside the manifest rather than inside it because the per-method
+     * <em>reason</em> is not part of the frozen typed model -- {@link MethodEntry} carries
+     * {@code tier2} as a bare boolean. {@link ManifestJsonWriter} joins the two when it emits the
+     * document, and the CLI reports the breakdown from it.
+     */
     public record ScanResult(Manifest manifest,
                              int classesScanned,
                              int generatedClassesSkipped,
-                             int serviceProvidersDeclared) {
+                             int serviceProvidersDeclared,
+                             Tier2Selection tier2) {
     }
 
     private final InventoryScanner inventoryScanner;
     private final CallSiteScanner callSiteScanner;
     private final MethodCandidateFactory candidateFactory;
+    private final Tier2Selector tier2Selector;
     private final EntryPointDetector entryPointDetector;
     private final PublicApiDetector publicApiDetector;
     private final TestClassifier testClassifier;
@@ -72,6 +83,7 @@ public final class ManifestAssembler {
     public ManifestAssembler(InventoryScanner inventoryScanner,
                              CallSiteScanner callSiteScanner,
                              MethodCandidateFactory candidateFactory,
+                             Tier2Selector tier2Selector,
                              EntryPointDetector entryPointDetector,
                              PublicApiDetector publicApiDetector,
                              TestClassifier testClassifier,
@@ -81,6 +93,7 @@ public final class ManifestAssembler {
         this.inventoryScanner = inventoryScanner;
         this.callSiteScanner = callSiteScanner;
         this.candidateFactory = candidateFactory;
+        this.tier2Selector = tier2Selector;
         this.entryPointDetector = entryPointDetector;
         this.publicApiDetector = publicApiDetector;
         this.testClassifier = testClassifier;
@@ -94,6 +107,8 @@ public final class ManifestAssembler {
      *
      * @throws IllegalArgumentException if the source yielded no classes at all -- an empty manifest
      *         would make every method in the artifact look unobserved, so it must be an error
+     * @throws dev.auxin.staticscan.tier2.Tier2BudgetExceededException if tier-2 selection is larger
+     *         than the configured budget
      */
     public ScanResult assemble(ClassSource source, String buildSha, String artifact)
             throws IOException {
@@ -110,14 +125,24 @@ public final class ManifestAssembler {
                 new CallGraphBuilder(hierarchy).build(collector.invocations);
 
         Set<String> testClassNames = testClassNames(collector.classes);
-        List<EntryPoint> entryPoints =
-                entryPointDetector.detect(collector.classes, collector.serviceProviders);
+        // The hierarchy is passed in rather than rebuilt: interface- and superclass-based boundary
+        // detection asks exactly the question it already answers, and a second copy of the subtype
+        // relation is a second thing that can disagree with the call graph.
+        List<EntryPoint> entryPoints = entryPointDetector.detect(
+                collector.classes, collector.serviceProviders, hierarchy);
 
         Map<MethodRef, MethodLinkage> linkage = testLinkageAnalyzer.analyse(
                 collector.classes, testClassNames, resolvedEdges,
                 productionEntryPoints(entryPoints, testClassNames));
 
-        Map<String, List<MethodEntry>> probeIndex = ProbeIndex.assign(candidates(collector.classes));
+        // Tier-2 selection sits between the candidates and the probe index because the selector
+        // reads each candidate's own eligibility (probeable, C51-observable) off the candidate, and
+        // because a budget overrun must fail the scan before a manifest is written.
+        List<MethodCandidate> candidates = candidates(collector.classes);
+        Tier2Selection tier2 = tier2Selector.select(candidates, entryPoints, testClassNames);
+
+        Map<String, List<MethodEntry>> probeIndex =
+                ProbeIndex.assign(candidateFactory.withTier2(candidates, tier2));
 
         List<ClassEntry> classes = new ArrayList<>(collector.classes.size());
         for (ClassModel model : collector.classes) {
@@ -132,7 +157,7 @@ public final class ManifestAssembler {
         Manifest manifest = new Manifest(Manifest.SCHEMA_VERSION, buildSha, artifact,
                 generatedAt(), classes, entryPoints, callEdges);
         return new ScanResult(manifest, collector.classes.size(), collector.generatedSkipped,
-                collector.serviceProviders.size());
+                collector.serviceProviders.size(), tier2);
     }
 
     private ClassEntry toClassEntry(ClassModel model,

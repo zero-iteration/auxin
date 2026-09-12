@@ -12,6 +12,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -132,10 +133,32 @@ class ManifestJsonTest {
     @Test
     @DisplayName("an unknown schemaVersion is rejected loudly, not best-effort parsed")
     void rejectsUnknownSchemaVersion() {
+        // BUG #19: this used version 2 -- the version the writer actually emits -- so it pinned
+        // "reject the manifest we ourselves produce" as correct. 99 is used now because the point
+        // of the refusal is that an UNKNOWN version may carry a different probe-index assignment
+        // (A14 defect 2), not that the number is large.
         ManifestFormatException e = assertThrows(ManifestFormatException.class,
-                () -> ManifestReader.parse("{\"schemaVersion\":2,\"buildSha\":\"a\",\"artifact\":\"b\","
+                () -> ManifestReader.parse("{\"schemaVersion\":99,\"buildSha\":\"a\",\"artifact\":\"b\","
                         + "\"generatedAt\":\"t\",\"classes\":[],\"entryPoints\":[],\"callEdges\":[]}"));
-        assertTrue(e.getMessage().contains("unsupported schemaVersion 2"), e.getMessage());
+        assertTrue(e.getMessage().contains("unsupported schemaVersion 99"), e.getMessage());
+    }
+
+    @Test
+    @DisplayName("every version this build writes is a version it can read")
+    void writesOnlyWhatItCanRead() {
+        // BUG #19 regression. SCHEMA_VERSION was 1 while the writer emitted all six of v2's
+        // fields, so a reader honouring CONTRACTS §1's v1 rule ("a v1 manifest nominates nothing")
+        // would ignore fields the document actually carried. Invisible because the deleted
+        // in-agent ManifestTool stand-in stamped 2 and the agent tolerated either -- the same
+        // stand-in-for-each-other seam that hid bug #17 on the wire.
+        assertTrue(Manifest.READABLE_SCHEMA_VERSIONS.contains(Manifest.SCHEMA_VERSION),
+                "the writer emits " + Manifest.SCHEMA_VERSION + " but the reader accepts only "
+                        + Manifest.READABLE_SCHEMA_VERSIONS);
+        for (Integer v : Manifest.READABLE_SCHEMA_VERSIONS) {
+            String json = "{\"schemaVersion\":" + v + ",\"buildSha\":\"a\",\"artifact\":\"b\","
+                    + "\"generatedAt\":\"t\",\"classes\":[],\"entryPoints\":[],\"callEdges\":[]}";
+            assertNotNull(ManifestReader.parse(json), "schemaVersion " + v + " must be readable");
+        }
     }
 
     @Test

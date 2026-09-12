@@ -21,6 +21,9 @@ import java.util.Map;
  */
 public final class Options {
 
+    /** The canonical ingest route (CONTRACTS section 2). */
+    public static final String INGEST_PATH = "/v1/ingest";
+
     /** {@code if (!probes[idx]) probes[idx] = true;} — 1 frame/probe, no store once covered. */
     public static final String PROBE_MODE_READ_THEN_STORE = "readthenstore";
     /** {@code probes[idx] = true;} — no branch, no frame, but a store on EVERY execution. */
@@ -48,6 +51,43 @@ public final class Options {
     public final boolean tier1Enabled;
     public final boolean tier2Enabled;
     public final boolean stripEnabled;
+
+    /**
+     * The runtime call-edge tier (SCOPE-v3). <b>OFF by default.</b>
+     *
+     * <p>It is the one tier that instruments every method twice (entry and every return) rather
+     * than once, so it is opt-in per deployment even though the unsampled per-call cost is one
+     * static load and one branch. Level two of the three-level kill switch, exactly like
+     * {@link #tier1Enabled} / {@link #tier2Enabled}; level one is {@link #enabled} and level
+     * three is the {@link Scope} exclude list, which the edge tier obeys because it is emitted
+     * by the same transformer pass.
+     */
+    public final boolean edgesEnabled;
+
+    /**
+     * 1-in-N entries into a tier-2 boundary method are traced. Rounded up to a power of two so
+     * the decision is {@code (++n & (N-1)) == 0} — one increment and one AND on a per-thread
+     * counter, no clock, no random, no atomic. {@code 1} traces every root entry and exists for
+     * the smoke suite, which must be deterministic; the production default is 1024.
+     */
+    public final int edgesSampleRate;
+
+    /** Frames recorded per sampled root invocation. Past it, nothing is recorded and it is counted. */
+    public final int edgesMaxDepth;
+
+    /** Edges recorded per sampled root invocation. Past it, nothing is recorded and it is counted. */
+    public final int edgesMaxPerRoot;
+
+    /**
+     * Distinct {@code (caller, callee)} pairs the drain thread will track. A cap, because the
+     * window payload carries one JSON object per distinct edge and an application with a wide
+     * dynamic-dispatch fan-out would otherwise decide our flush size for us. Refusals are
+     * counted on the wire.
+     */
+    public final int edgesMaxDistinct;
+
+    /** Capacity of the edge tier's own ring. Pre-allocated at premain, never resized. */
+    public final int edgesRingCapacity;
 
     /**
      * G1 overturned PLAN-v2's blind store: at 10 threads blind costs +0.72-0.77 ns/probe (the
@@ -112,6 +152,26 @@ public final class Options {
         this.tier1Enabled = bool(a, "tier1.enabled", true);
         this.tier2Enabled = bool(a, "tier2.enabled", true);
         this.stripEnabled = bool(a, "strip.enabled", true);
+        // OFF by default (SCOPE-v3): a new tier does not turn itself on in production.
+        // ON BY DEFAULT (owner's decision, 2026-09-12). Justified by G6: the unsampled path costs
+        // 0.028 / 0.092 / 0.340 ns per instrumented method at 1 / 4 / 10 threads, against the
+        // 0.72-0.77 ns/probe that G1 rejected as too expensive for tier-1 -- so this is under half
+        // of an already-rejected cost, and it is the only source of runtime call relationships now
+        // that SCOPE-v3 makes auxin the sole agent.
+        //
+        // The cost that is NOT near-zero, and the reason to keep the switch: while ANY thread is
+        // inside a sampled trace, EVERY other thread's calls fall through the gate into a
+        // ThreadLocal read that finds nothing -- 0.25 ns/call site at 1 thread, 1.56 ns at 10. A
+        // deployment with many threads and long traces sits nearer that figure than the unsampled
+        // one. Raise ax.edges.sample.rate, or set ax.edges.enabled=false, if that shows up.
+        this.edgesEnabled = bool(a, "edges.enabled", true);
+        this.edgesSampleRate = pow2From(num(a, "edges.sample.rate", 1024), 1, "edges.sample.rate");
+        this.edgesMaxDepth = (int) clamp(num(a, "edges.max.depth", 32), 1, 4096, "edges.max.depth");
+        this.edgesMaxPerRoot = (int) clamp(num(a, "edges.max.per.root", 256), 0, 1 << 20,
+                "edges.max.per.root");
+        this.edgesMaxDistinct = (int) clamp(num(a, "edges.max.distinct", 8192), 1, 1 << 20,
+                "edges.max.distinct");
+        this.edgesRingCapacity = pow2((int) num(a, "edges.ring.capacity", 16384));
         this.probeMode = oneOf(a, "probe.mode", PROBE_MODE_READ_THEN_STORE,
                 PROBE_MODE_READ_THEN_STORE, PROBE_MODE_BLIND);
         this.condyArrayDescriptor = CONDY_DESC_ARRAY.equals(
@@ -138,7 +198,28 @@ public final class Options {
         this.productionEnvironments = prod;
 
         this.transportEnabled = bool(a, "transport.enabled", true);
-        this.collectorUrl = str(a, "collector.url", "");
+        // BUG #23: HttpSender's javadoc says "POST /v1/ingest" but it posts to this URL RAW, so a
+        // natural `ax.collector.url=http://host:8080` posted to `/` while the collector serves
+        // `/v1/ingest` -- every window 404'd, silently, and the circuit breaker then opened. Found
+        // the first time the real agent was pointed at the real collector. Fourth bug of this exact
+        // shape: two components each verified against a stand-in for the other.
+        //
+        // A bare authority now gets the canonical ingest path appended, announced once. An explicit
+        // path is honoured untouched, so a reverse proxy or a custom mount still works.
+        String cu = str(a, "collector.url", "");
+        if (!cu.isEmpty()) {
+            int scheme = cu.indexOf("://");
+            String afterAuthority = scheme < 0 ? "" : cu.substring(scheme + 3);
+            int slash = afterAuthority.indexOf('/');
+            String path = slash < 0 ? "" : afterAuthority.substring(slash);
+            if (path.isEmpty() || path.equals("/")) {
+                String base = slash < 0 ? cu : cu.substring(0, cu.length() - path.length());
+                cu = base + INGEST_PATH;
+                Log.info("collector.url had no path: posting to " + cu
+                        + " (set an explicit path to override)");
+            }
+        }
+        this.collectorUrl = cu;
         this.collectorTimeoutMs = (int) num(a, "collector.timeout.ms", 5000);
         this.flushIntervalMs = num(a, "flush.interval.ms", 60000);
         this.drainIntervalMs = num(a, "drain.interval.ms", 200);
@@ -233,6 +314,34 @@ public final class Options {
         return p == n ? n : p << 1;
     }
 
+    /**
+     * Rounds up to a power of two, out loud. The sampling decision is a mask, so a rate of 1000
+     * is not representable — silently sampling 1-in-1024 while the operator believes 1-in-1000
+     * would make every edge count on the wire wrong by 2.4% with nothing to point at.
+     */
+    private static int pow2From(long raw, int min, String key) {
+        long n = raw < min ? min : raw;
+        if (n > (1L << 30)) n = 1L << 30;
+        int p = Integer.highestOneBit((int) n);
+        int out = p == (int) n ? p : p << 1;
+        if (out != raw) {
+            Log.warn("ax." + key + "=" + raw + " is not a power of two (the sampling decision is "
+                    + "a bitmask): using " + out + ". Edge counts on the wire scale by this "
+                    + "number, so it is reported as agentHealth.edgesSampleRate.");
+        }
+        return out;
+    }
+
+    private static long clamp(long v, long lo, long hi, String key) {
+        if (v < lo || v > hi) {
+            long out = v < lo ? lo : hi;
+            Log.warn("ax." + key + "=" + v + " is out of range [" + lo + ".." + hi + "]: using "
+                    + out);
+            return out;
+        }
+        return v;
+    }
+
     private static String defaultInstanceId() {
         String host = System.getenv("HOSTNAME");
         if (host == null || host.isEmpty()) host = System.getenv("POD_NAME");
@@ -254,6 +363,10 @@ public final class Options {
                 + " tier1=" + tier1Enabled
                 + " tier2=" + tier2Enabled
                 + " strip=" + stripEnabled
+                + " edges=" + edgesEnabled
+                + (edgesEnabled ? " edgesSampleRate=" + edgesSampleRate
+                        + " edgesMaxDepth=" + edgesMaxDepth
+                        + " edgesMaxPerRoot=" + edgesMaxPerRoot : "")
                 + " probeMode=" + probeMode
                 + " condyDescriptor=" + (condyArrayDescriptor ? CONDY_DESC_ARRAY : CONDY_DESC_OBJECT)
                 + " bridge=" + bridgeEnabled

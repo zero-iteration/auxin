@@ -6,6 +6,7 @@ import io.auxin.agent.manifest.Eligibility;
 import io.auxin.agent.manifest.Manifest;
 import io.auxin.agent.manifest.SchemaHash;
 import io.auxin.agent.runtime.BootstrapBridge;
+import io.auxin.agent.runtime.EdgeRegistry;
 import io.auxin.agent.runtime.Tier2Registry;
 import io.auxin.agent.util.Log;
 import org.objectweb.asm.ConstantDynamic;
@@ -153,6 +154,14 @@ public final class ProbeEmitter {
     static final String TIER2_EXIT_ERROR = "exitError";
     static final String TIER2_EXIT_ERROR_DESC = "(JILjava/lang/Throwable;)V";
 
+    /** The call-edge tier (SCOPE-v3). Four entry points, all {@code (I)V}: an id and nothing else. */
+    static final String EDGE = "io/auxin/agent/runtime/EdgeRuntime";
+    static final String EDGE_ENTER = "enter";
+    static final String EDGE_EXIT = "exit";
+    static final String EDGE_ROOT_ENTER = "rootEnter";
+    static final String EDGE_ROOT_EXIT = "rootExit";
+    static final String EDGE_DESC = "(I)V";
+
     /** Condy is only available from class file version 55 (Java 11). */
     public static final int CONDY_MIN_VERSION = 55;
     /** StackMapTable is only meaningful from version 50 (Java 6). */
@@ -181,15 +190,44 @@ public final class ProbeEmitter {
     public static final class Result {
         public int probes;
         public int tier2Methods;
+        /** Methods carrying call-edge instrumentation, roots included. */
+        public int edgeMethods;
+        /** The subset of {@link #edgeMethods} that are sampling roots (tier-2 boundary methods). */
+        public int edgeRoots;
         public boolean usedCondy;
         public int access;
         public String skipReason;
+        /**
+         * The INSTALLED-PROBE MASK: {@code installedProbes[idx]} is true iff a probe was actually
+         * emitted at manifest index {@code idx}. Length is always {@code entry.probeCount}, so it
+         * lines up 1:1 with the probe array and with {@code coverage[].probes} on the wire.
+         *
+         * <p><b>Why this has to exist.</b> The probe array is sized to every probe-eligible method
+         * in the manifest, but this emitter installs a probe at only some of those indices: C51
+         * exempts a method that cannot be covered dynamically, a method absent from the manifest
+         * has no index to write, a frame that cannot be built safely skips one method, and
+         * {@code ax.tier1.enabled=false} skips all of them. An index with no probe can never be
+         * written by anything, so two consumers were reading it wrong:
+         * <ul>
+         *   <li>Tier-1b gated its strip on "every bit in the array is set", which is
+         *       unsatisfiable for any class holding one C51-exempt method — so those classes kept
+         *       their probes for the life of the JVM and steady-state overhead never reached
+         *       zero, which is the whole point of the tier;</li>
+         *   <li>the flush payload shipped that permanently-zero bit next to genuinely-zero bits,
+         *       i.e. as evidence that a method never ran.</li>
+         * </ul>
+         *
+         * <p><b>Cost.</b> Written once per class at transform time and read only by the drain
+         * thread. Nothing is added to any per-call path.
+         */
+        public boolean[] installedProbes;
 
-        public boolean changed() { return probes > 0 || tier2Methods > 0; }
+        public boolean changed() { return probes > 0 || tier2Methods > 0 || edgeMethods > 0; }
     }
 
     private final boolean tier1Enabled;
     private final boolean tier2Enabled;
+    private final boolean edgesEnabled;
     private final boolean blindMode;
     private final boolean condyArrayDescriptor;
     private final boolean selfBsmBridge;
@@ -197,6 +235,7 @@ public final class ProbeEmitter {
     public ProbeEmitter(Options options) {
         this.tier1Enabled = options.tier1Enabled;
         this.tier2Enabled = options.tier2Enabled;
+        this.edgesEnabled = options.edgesEnabled;
         this.blindMode = Options.PROBE_MODE_BLIND.equals(options.probeMode);
         this.condyArrayDescriptor = options.condyArrayDescriptor;
         this.selfBsmBridge = Options.BRIDGE_SHAPE_SELF_BSM.equals(options.bridgeShape);
@@ -308,10 +347,19 @@ public final class ProbeEmitter {
             bridgeBsm = bridgeBootstrap(cn, dotted, entry.probeCount, version, isInterface);
         }
 
+        // The installed-probe mask. Allocated here, filled in by the loop below, and handed to
+        // ProbeHolder alongside the probe array so the drain thread can gate Tier-1b on the
+        // indices a probe really went into. Sized from the manifest, exactly like the probe
+        // array, so index i means the same thing in both.
+        final boolean[] installed = new boolean[Math.max(0, entry.probeCount)];
+        r.installedProbes = installed;
+
         int notInManifest = 0;
         int notObservable = 0;
         int frameUnsupported = 0;
         int tier2NotBridgeable = 0;
+        int edgesNotBridgeable = 0;
+        int edgeUnsupported = 0;
 
         for (int i = 0; i < eligible.size(); i++) {
             MethodNode m = eligible.get(i);
@@ -341,8 +389,34 @@ public final class ProbeEmitter {
                 }
             }
             if (tier1Enabled) {
-                if (emitTier1(cn, m, constant, access, me.idx, version)) r.probes++;
-                else frameUnsupported++;
+                if (emitTier1(cn, m, constant, access, me.idx, version)) {
+                    r.probes++;
+                    // The ONE place that knows an index really carries a probe. A manifest index
+                    // outside the declared probeCount is a manifest defect, not something to
+                    // write past the end of the mask for; it is already impossible because the
+                    // schemaHash check above passed, and it is bounds-checked anyway.
+                    if (me.idx >= 0 && me.idx < installed.length) installed[me.idx] = true;
+                } else {
+                    frameUnsupported++;
+                }
+            }
+            // LAST, deliberately. The edge tier wraps whatever tier-2 emitted (its try range has
+            // to cover tier-2's own handler, or an exception leaving a boundary method would
+            // leak a trace), and emitting it last also leaves tier-1's probe exactly where it is
+            // today: emitting it FIRST would put a call at bytecode offset 0 and stop
+            // emitTier1() from reusing a stack map frame that was already there.
+            if (edgesEnabled) {
+                if (isBridge(access)) {
+                    edgesNotBridgeable++;
+                } else {
+                    final boolean root = me.tier2;
+                    if (emitEdge(cn, m, dotted, me.idx, version, root)) {
+                        r.edgeMethods++;
+                        if (root) r.edgeRoots++;
+                    } else {
+                        edgeUnsupported++;
+                    }
+                }
             }
         }
 
@@ -353,6 +427,12 @@ public final class ProbeEmitter {
         }
         if (tier2NotBridgeable > 0) {
             Health.skip(Health.SKIP_TIER2_NOT_BRIDGEABLE, tier2NotBridgeable);
+        }
+        if (edgesNotBridgeable > 0) {
+            Health.skip(Health.SKIP_EDGES_NOT_BRIDGEABLE, edgesNotBridgeable);
+        }
+        if (edgeUnsupported > 0) {
+            Health.skip(Health.SKIP_EDGE_UNSUPPORTED, edgeUnsupported);
         }
 
         if (r.probes > 0) {
@@ -851,6 +931,149 @@ public final class ProbeEmitter {
                 return t.getDescriptor();
             default:
                 return t.getInternalName();
+        }
+    }
+
+    // ---------------- the call-edge tier (SCOPE-v3) ----------------
+
+    /**
+     * Installs call-edge instrumentation on one method. Independent of tier-1 and tier-2 in both
+     * directions: a method whose probe could not be emitted still records edges, a class whose
+     * probes Tier-1b later strips still records edges (the stripper matches probe shapes, and
+     * nothing here looks like one), and a method the edge tier refuses still gets its probe.
+     *
+     * @param root true when this is a tier-2 allowlisted boundary method, i.e. a sampling root.
+     * @return true when instrumentation was installed.
+     */
+    private boolean emitEdge(ClassNode cn, MethodNode m, String dotted, int idx, int version,
+                             boolean root) {
+        try {
+            if (hasJsr(m)) return false;                    // pre-Java-6 subroutines
+            // The root is the only frame that needs an exception handler, and a handler in
+            // <init> would have to merge an uninitializedThis frame -- the same trade tier-2
+            // refuses, for the same reason.
+            if (root && "<init>".equals(m.name)) return false;
+            final int edgeId = EdgeRegistry.register(dotted, idx);
+            if (edgeId < 0) return false;                   // 24-bit id space exhausted
+            return root ? emitEdgeRoot(m, edgeId, version) : emitEdgeCallee(m, edgeId);
+        } catch (Throwable t) {
+            Log.debug("edge emission failed for " + cn.name + "#" + m.name, t);
+            return false;
+        }
+    }
+
+    /**
+     * The callee shape: two call sites and nothing else.
+     * <pre>
+     *   push id; INVOKESTATIC EdgeRuntime.enter(I)V        // at the head
+     *   push id; INVOKESTATIC EdgeRuntime.exit(I)V         // before every return
+     * </pre>
+     *
+     * <p><b>No local, no branch, no exception handler, therefore no stack map frame.</b> That is
+     * the whole reason this shape was chosen over holding a depth token in a local: a local has
+     * to be declared in every pre-existing frame of the method (the tier-2
+     * {@code extendFrameLocals} problem), which needs EXPAND_FRAMES on the class and rules out
+     * every method whose frames cannot be expanded. As emitted here the edge tier adds nothing
+     * the verifier has to be told about and works on any class file version, including the
+     * v50 and pre-55 cases where tier-1 itself has to change shape.
+     *
+     * <p>The cost of having no handler is that an exception unwinding past this method skips its
+     * {@code exit}, leaving a stale frame on the per-thread stack.
+     * {@code EdgeRuntime.popTo} repairs that: it pops to the frame it is given, discarding
+     * whatever is above it, so the first exit that does run puts the stack back.
+     */
+    private static boolean emitEdgeCallee(MethodNode m, int edgeId) {
+        InsnList pre = new InsnList();
+        push(pre, edgeId);
+        pre.add(new MethodInsnNode(Opcodes.INVOKESTATIC, EDGE, EDGE_ENTER, EDGE_DESC, false));
+        m.instructions.insert(pre);
+        insertBeforeReturns(m, edgeId, EDGE_EXIT);
+        m.maxStack = Math.max(m.maxStack + 1, 2);
+        return true;
+    }
+
+    /**
+     * The root shape: the callee shape plus a {@code catch (Throwable)} that also calls
+     * {@code rootExit} and rethrows.
+     *
+     * <pre>
+     *   push id; INVOKESTATIC EdgeRuntime.rootEnter(I)V
+     *   tryStart:
+     *      ... everything tier-2 and tier-1 emitted, and the body ...
+     *      push id; INVOKESTATIC EdgeRuntime.rootExit(I)V   // before every return
+     *   tryEnd:
+     *   handler:  [stack: Throwable]
+     *      push id; INVOKESTATIC EdgeRuntime.rootExit(I)V
+     *      ATHROW
+     * </pre>
+     *
+     * <p><b>Why the root, and only the root, pays for a handler.</b> {@code rootEnter} is what
+     * makes the global gate non-zero. A trace that is never closed leaves it non-zero for ever,
+     * and every instrumented call in the JVM then pays a thread-local read instead of a load and
+     * a branch — the one failure mode that would cost real money. So the root's exit must run on
+     * the exceptional path too, and a boundary method throwing is not hypothetical (the smoke
+     * suite's own {@code boundary(-1)} does).
+     *
+     * <p><b>The frame.</b> One entry declaring <b>zero locals</b> and a single
+     * {@code java/lang/Throwable} on the stack. Zero locals is not laziness: the handler reads
+     * no local at all (the id is a bytecode constant and the throwable is on the stack), and an
+     * undeclared local is {@code top}, which every actual type is assignable to. Declaring the
+     * real local layout would mean re-deriving it after tier-2 has already added its own slot —
+     * more code, and every extra named type is another chance to name it wrong, which is a
+     * VerifyError at class definition rather than a missing edge.
+     *
+     * <p>It is written {@code F_NEW} when the method's other frames are expanded and
+     * {@code F_FULL} when they are compressed, because ASM cannot mix the two within one method.
+     * Both encode the identical {@code full_frame} on the wire. Getting this wrong is not
+     * theoretical: with {@code ax.tier2.enabled=false} nothing else in the method is expanded,
+     * tier-1 emits a compressed {@code SAME} entry, and an unconditional {@code F_NEW} here
+     * silently refused to instrument every root in the JVM.
+     *
+     * <p><b>The range covers tier-2's handler.</b> Both handlers catch anything; the JVM tries
+     * the exception table in order and tier-2's entry is added first, so tier-2 still classifies
+     * the error. It then rethrows from inside our range, and we close the trace.
+     */
+    private static boolean emitEdgeRoot(MethodNode m, int edgeId, int version) {
+        final LabelNode tryStart = new LabelNode();
+        final LabelNode tryEnd = new LabelNode();
+        final LabelNode handler = new LabelNode();
+
+        InsnList pre = new InsnList();
+        push(pre, edgeId);
+        pre.add(new MethodInsnNode(Opcodes.INVOKESTATIC, EDGE, EDGE_ROOT_ENTER, EDGE_DESC, false));
+        pre.add(tryStart);
+        m.instructions.insert(pre);
+
+        insertBeforeReturns(m, edgeId, EDGE_ROOT_EXIT);
+
+        InsnList post = new InsnList();
+        post.add(tryEnd);
+        post.add(handler);
+        if (version >= FRAMES_MIN_VERSION) {
+            post.add(new FrameNode(hasExpandedFrame(m) ? Opcodes.F_NEW : Opcodes.F_FULL,
+                    0, new Object[0], 1, new Object[]{"java/lang/Throwable"}));
+        }
+        push(post, edgeId);
+        post.add(new MethodInsnNode(Opcodes.INVOKESTATIC, EDGE, EDGE_ROOT_EXIT, EDGE_DESC, false));
+        post.add(new InsnNode(Opcodes.ATHROW));
+        m.instructions.add(post);
+
+        if (m.tryCatchBlocks == null) m.tryCatchBlocks = new ArrayList<TryCatchBlockNode>();
+        m.tryCatchBlocks.add(new TryCatchBlockNode(tryStart, tryEnd, handler, null));
+
+        m.maxStack = Math.max(m.maxStack + 1, 2);
+        return true;
+    }
+
+    /** {@code push id; INVOKESTATIC EdgeRuntime.<name>(I)V} before every return in the method. */
+    private static void insertBeforeReturns(MethodNode m, int edgeId, String name) {
+        for (AbstractInsnNode insn = m.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            final int op = insn.getOpcode();
+            if (op < Opcodes.IRETURN || op > Opcodes.RETURN) continue;
+            InsnList l = new InsnList();
+            push(l, edgeId);
+            l.add(new MethodInsnNode(Opcodes.INVOKESTATIC, EDGE, name, EDGE_DESC, false));
+            m.instructions.insertBefore(insn, l);
         }
     }
 

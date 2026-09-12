@@ -39,10 +39,36 @@ public final class CoverageSnapshot {
         return false;
     }
 
-    public static boolean allSet(boolean[] a) {
-        if (a.length == 0) return false;
-        for (int i = 0; i < a.length; i++) if (!a[i]) return false;
-        return true;
+    /**
+     * Tier-1b's strip gate: is every probe that was <b>actually installed</b> set?
+     *
+     * <p>This replaced a plain "every bit in the array is set" test, which could never be
+     * satisfied by any class carrying one C51-exempt method. The probe array is sized to every
+     * probe-eligible method in the manifest, but {@code ProbeEmitter} installs a probe at only
+     * some of those indices; a slot with no probe is never written by anything, so the old gate
+     * was false for the life of the JVM and the class's probes stayed on the hot path — the exact
+     * cost Tier-1b exists to remove.
+     *
+     * <p>Returns false when the installed set is EMPTY, deliberately. A class with no installed
+     * probe has nothing to strip, so calling it strippable would send a retransform that removes
+     * nothing and then has to be graded a no-op — inflating the bookkeeping with exactly the
+     * kind of phantom success G5-BUG-3 removed. Such a class is not a candidate at all.
+     *
+     * <p>Also false on any disagreement between the two arrays: a length mismatch means we do not
+     * know what we are looking at, and the answer to that is to leave the probes alone.
+     *
+     * @param live      the accumulating probe array
+     * @param installed the installed-probe mask from {@code ProbeHolder.installedProbes}
+     */
+    public static boolean allInstalledSet(boolean[] live, boolean[] installed) {
+        if (live == null || installed == null || live.length != installed.length) return false;
+        boolean anyInstalled = false;
+        for (int i = 0; i < live.length; i++) {
+            if (!installed[i]) continue;
+            anyInstalled = true;
+            if (!live[i]) return false;
+        }
+        return anyInstalled;
     }
 
     public static int countSet(boolean[] a) {

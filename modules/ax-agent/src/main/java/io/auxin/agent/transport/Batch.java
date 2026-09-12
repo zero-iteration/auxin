@@ -69,10 +69,33 @@ public final class Batch {
         sb.append(w.stripBlocked);
         h = Json.key(sb, h, "stripReArms");
         sb.append(w.stripReArms);
+        h = Json.key(sb, h, "stripMaskMissing");
+        sb.append(w.stripMaskMissing);
         h = Json.key(sb, h, "scopeMatchedNothing");
         sb.append(w.scopeMatchedNothing);
         h = Json.key(sb, h, "classesLoadedTruncated");
         sb.append(w.classesLoadedTruncated);
+        // --- SCOPE-v3 call-edge tier: additive, raw counts, inside agentHealth ---
+        h = Json.key(sb, h, "edgesEnabled");
+        sb.append(w.edgesEnabled);
+        h = Json.key(sb, h, "edgesSampleRate");
+        sb.append(w.edgesSampleRate);
+        h = Json.key(sb, h, "edgesSampledRoots");
+        sb.append(w.edgesSampledRoots);
+        h = Json.key(sb, h, "edgesRecorded");
+        sb.append(w.edgesRecorded);
+        h = Json.key(sb, h, "edgesDropped");
+        sb.append(w.edgesDropped);
+        h = Json.key(sb, h, "edgesTruncatedDepth");
+        sb.append(w.edgesTruncatedDepth);
+        h = Json.key(sb, h, "edgesTruncatedRoot");
+        sb.append(w.edgesTruncatedRoot);
+        h = Json.key(sb, h, "edgesTruncatedDistinct");
+        sb.append(w.edgesTruncatedDistinct);
+        h = Json.key(sb, h, "edgeTierFailures");
+        sb.append(w.edgeTierFailures);
+        h = Json.key(sb, h, "edgeTracesReaped");
+        sb.append(w.edgeTracesReaped);
         sb.append('}');
 
         first = Json.key(sb, first, "classesLoaded");
@@ -94,6 +117,11 @@ public final class Batch {
             Json.writeString(sb, c.schemaHash == null ? "" : c.schemaHash);
             cf = Json.key(sb, cf, "probes");
             Json.writeString(sb, c.probesBase64);
+            // Additive, alongside `probes` and packed identically. `probes` alone cannot say
+            // whether a zero bit is "did not run" or "no probe was ever installed here", and a
+            // bit nothing can set must never ship as evidence that a method never ran.
+            cf = Json.key(sb, cf, "probesInstalled");
+            Json.writeString(sb, c.probesInstalledBase64 == null ? "" : c.probesInstalledBase64);
             sb.append('}');
         }
         sb.append(']');
@@ -130,6 +158,29 @@ public final class Batch {
             sb.append(']');
             tf = Json.key(sb, tf, "bucketScheme");
             Json.writeString(sb, t.bucketScheme);
+            sb.append('}');
+        }
+        sb.append(']');
+
+        // Additive alongside coverage and tier2 (SCOPE-v3). Always emitted, empty when the tier
+        // is off: an absent key and a zero-length graph are different facts to a collector.
+        first = Json.key(sb, first, "edges");
+        sb.append('[');
+        for (int i = 0; i < w.edges.size(); i++) {
+            WindowPayload.Edge e = w.edges.get(i);
+            if (i > 0) sb.append(',');
+            sb.append('{');
+            boolean ef = true;
+            ef = Json.key(sb, ef, "fromClass");
+            Json.writeString(sb, e.fromClass);
+            ef = Json.key(sb, ef, "fromIdx");
+            sb.append(e.fromIdx);
+            ef = Json.key(sb, ef, "toClass");
+            Json.writeString(sb, e.toClass);
+            ef = Json.key(sb, ef, "toIdx");
+            sb.append(e.toIdx);
+            ef = Json.key(sb, ef, "count");
+            sb.append(e.count);
             sb.append('}');
         }
         sb.append(']');

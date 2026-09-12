@@ -66,7 +66,7 @@ public final class ProbeInstaller implements ClassFileTransformer {
         if (classBeingRedefined != null) return null;   // HARD RULE: never act on a retransform
         if (internalName == null || buffer == null) return null;
         if (!options.enabled) return null;
-        if (!options.tier1Enabled && !options.tier2Enabled) return null;
+        if (!options.tier1Enabled && !options.tier2Enabled && !options.edgesEnabled) return null;
 
         // G5-BUG-1. The ignore rules used to be one flat list consulted HERE, ahead of the
         // scope, returning null without touching a counter. An application package that shared
@@ -167,7 +167,13 @@ public final class ProbeInstaller implements ClassFileTransformer {
             // locals makes the verifier treat the slot as TOP at that point, which then fails
             // to merge with the handler frame). Expanding costs transform CPU, so it is paid
             // only by the 50-200 boundary methods, never by tier-1-only classes.
-            boolean expand = options.tier2Enabled && entry.hasTier2;
+            //
+            // The edge tier joins the same condition rather than widening it: its ROOTS are the
+            // tier-2 boundary methods and they get an exception handler, whose frame has to be
+            // written expanded when the rest of the method's frames are. Its CALLEES add no
+            // local, no branch and no handler, so a class with no boundary method still costs
+            // nothing extra to read -- which keeps the A11 startup-CPU bill exactly where it is.
+            boolean expand = entry.hasTier2 && (options.tier2Enabled || options.edgesEnabled);
             new ClassReader(buffer).accept(cn, expand ? ClassReader.EXPAND_FRAMES : 0);
 
             ProbeEmitter.Result r = emitter.instrument(cn, entry, agentVisible);
@@ -181,11 +187,15 @@ public final class ProbeInstaller implements ClassFileTransformer {
             cn.accept(cw);
             byte[] out = cw.toByteArray();
 
-            ProbeHolder.registerInstrumented(entry.name, entry.probeCount);
+            // The installed-probe mask travels with the array it indexes: without it the drain
+            // thread cannot tell a slot that is waiting for a call from a slot nothing will ever
+            // write, and Tier-1b's strip gate needs exactly that distinction.
+            ProbeHolder.registerInstrumented(entry.name, entry.probeCount, r.installedProbes);
             Health.classInstrumented(r.probes, r.tier2Methods);
             if (Log.debugEnabled()) {
                 Log.debug("instrumented " + entry.name + " probes=" + r.probes
-                        + " tier2=" + r.tier2Methods + " condy=" + r.usedCondy
+                        + " tier2=" + r.tier2Methods + " edges=" + r.edgeMethods
+                        + " edgeRoots=" + r.edgeRoots + " condy=" + r.usedCondy
                         + " access=" + r.access + " loaderSeesAgent=" + agentVisible);
             }
             dump(internalName, out);

@@ -38,6 +38,25 @@ public final class ProbeHolder {
             new ConcurrentHashMap<String, Boolean>();
 
     /**
+     * dotted class name -&gt; INSTALLED-PROBE MASK: which indices of {@link #ARRAYS}'s array a
+     * probe was actually emitted into. Same length as that array, same index meaning.
+     *
+     * <p>{@link #ARRAYS} is sized to every probe-eligible method in the build manifest, but
+     * {@code ProbeEmitter} installs a probe at only some of those indices — C51 exempts a method
+     * that cannot be covered dynamically, an unsafe entry frame skips one method,
+     * {@code ax.tier1.enabled=false} skips all of them. An index with no probe is <b>never
+     * written by anything</b>, which made Tier-1b's old "every bit is set" strip gate
+     * unsatisfiable for any class carrying a single C51-exempt method: the class kept its probes
+     * for the life of the JVM and steady-state overhead never reached zero. It also made the
+     * zero on the wire indistinguishable from "this method never ran".
+     *
+     * <p><b>Written once per class at transform time, read only by the drain thread.</b> Nothing
+     * on a per-call path touches it.
+     */
+    private static final ConcurrentHashMap<String, boolean[]> INSTALLED =
+            new ConcurrentHashMap<String, boolean[]>();
+
+    /**
      * Internal names the transformer was handed, recorded BEFORE any skip decision
      * (G5-FINDING-4).
      *
@@ -105,10 +124,59 @@ public final class ProbeHolder {
         return prev != null ? prev : created;
     }
 
-    /** Called by the installer at transform time; the class is about to be defined. */
-    public static void registerInstrumented(String className, int probeCount) {
+    /**
+     * Called by the installer at transform time; the class is about to be defined.
+     *
+     * <p>The mask is recorded BEFORE the array exists, so no reader can ever see a probe array
+     * for an instrumented class without also seeing which of its slots carry a probe.
+     *
+     * @param installed the installed-probe mask from {@code ProbeEmitter.Result}; may be null,
+     *                  in which case Tier-1b treats the class as undecidable and leaves its
+     *                  probes alone rather than guessing (see {@link #installedProbes}).
+     */
+    public static void registerInstrumented(String className, int probeCount, boolean[] installed) {
+        if (installed != null) mergeInstalled(className, installed);
         INSTRUMENTED.put(className, Boolean.TRUE);
         get(className, probeCount);
+    }
+
+    /**
+     * Unions one transform's mask into whatever is already recorded for this class name.
+     *
+     * <p>{@link #ARRAYS} is keyed by dotted name, so two class loaders that each define their own
+     * copy of a class share one probe array (child-first loaders, OSGi bundles — the isolation
+     * suite exercises both). They therefore share one mask too, and the union is the conservative
+     * merge in both directions: a probe installed in <i>either</i> copy can set its bit, so a
+     * zero there is real evidence, and requiring the union to be fully set makes the strip
+     * harder rather than easier.
+     *
+     * <p>Off the hot path by construction — once per class per loader, at transform time. The
+     * monotonic false-&gt;true stores need no synchronisation: a drain thread that reads a stale
+     * false delays one strip by one cycle and nothing else.
+     */
+    private static void mergeInstalled(String className, boolean[] installed) {
+        boolean[] prev = INSTALLED.putIfAbsent(className, installed);
+        // Two masks of different lengths cannot happen: both are sized from the probeCount of
+        // the SAME manifest entry, looked up by the same internal name. Keeping the first is the
+        // fail-open answer if it ever does, and DrainThread re-checks the length against the
+        // probe array before it acts on the mask at all.
+        if (prev == null || prev.length != installed.length) return;
+        for (int i = 0; i < installed.length; i++) {
+            if (installed[i]) prev[i] = true;
+        }
+    }
+
+    /**
+     * Which probe indices of {@code className} actually carry a probe, or null when there is no
+     * mask for it — which for a class in {@link #ARRAYS} should be unreachable, because
+     * {@link #registerInstrumented} records the mask before the array exists.
+     *
+     * <p>Drain-thread reader. A null answer must be treated as "cannot decide" — never as "no
+     * probes installed", which would make every class trivially strippable, and never as "all
+     * probes installed", which would put a permanently-zero bit back on the hot path.
+     */
+    public static boolean[] installedProbes(String className) {
+        return INSTALLED.get(className);
     }
 
     public static boolean[] peek(String className) {

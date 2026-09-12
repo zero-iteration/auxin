@@ -30,7 +30,25 @@ __all__ = [
 DEFAULT_PRODUCTION_ENVIRONMENTS: tuple[str, ...] = ("production", "prod")
 
 #: Where we look for the label, in priority order.
+#:
+#: >>> BUG #17, SECOND OCCURRENCE. `agentHealth.environment` is the CANONICAL
+#: spelling, pinned by CONTRACTS 2 ("Accept no synonyms in new code; the
+#: collector may keep tolerant aliases for one version"), and it is what the
+#: real agent emits -- `ax-agent`'s `Batch.java` writes `environment` INSIDE
+#: `agentHealth`. This tuple listed only the aliases, so `classify_payload`
+#: returned None for every window the real agent sends, and the C50 gate
+#: rejected all of them 403 `not_production_classified`: 100% data loss,
+#: reported as a misconfigured JVM. Exactly the bug #17 shape -- two
+#: components, each verified against a stand-in for the other, since every
+#: server fixture used `jvmClassification` and the agent's smoke listener
+#: accepts any body.
+#:
+#: The canonical path goes FIRST; the aliases stay because dropping them would
+#: break every existing fixture and deployment, and they are what "tolerant
+#: for one version" means. The allowlist and the fail-closed default are
+#: untouched: this adds a place to LOOK, never a way to pass.
 _ENV_KEYS: tuple[tuple[str, ...], ...] = (
+    ("agentHealth", "environment"),
     ("jvmClassification", "env"),
     ("jvmClassification", "environment"),
     ("environment",),

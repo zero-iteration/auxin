@@ -1165,3 +1165,51 @@ is skipped, absent from `instrumentedClasses`, **present** in `classesLoaded`.
   `include.packages` covering a test framework will taint windows it previously did not. Arguably
   more correct; confirm it is wanted.
 - x86_64 G1; a real cluster; Spring/CGLIB/fat-jar under three agents; OTLP span export.
+
+---
+
+# E2E — the seam nobody had ever tested: real agent -> real collector
+
+Everything in this project was verified per-component. **The one test never run was the two
+halves talking to each other.** Running it found three more bugs, two of them total pipeline
+breaks, in under five minutes.
+
+| # | bug | effect |
+|---|---|---|
+| **#21** | `collector/classification.py` never read `agentHealth.environment` — the spelling CONTRACTS §2 pins as **CANONICAL** and the one `Batch.java` actually writes. It checked only `jvmClassification.*` and a top-level `environment`. | **Every window 403'd `not_production_classified`. 100% data loss, reported as a misconfigured JVM.** |
+| **#22** | `ax-static` emits `semantics: "noop"` (CONTRACTS §1 says `blocking\|noop`); `ax-server` accepted only `{blocking, no-op, transitive}`. | **The real server could not LOAD the real manifest** — `ManifestError` at startup. Found in 30 seconds. |
+| **#23** | `HttpSender`'s javadoc says `POST /v1/ingest` but it posts to `ax.collector.url` **raw**, so a natural `http://host:8099` posted to `/` while the collector serves `/v1/ingest`. | **Every window 404'd silently**, then the circuit breaker opened. `bytesIn: 0`. |
+
+All three are the **same root cause as #17, #18 and #19**: each component was verified against a
+stand-in for the one it talks to — the agent flushes to a throwaway listener that accepts any body,
+the server's fixtures were hand-written. **Six bugs from one structural mistake.** Four of them were
+100% data loss.
+
+## The pipeline, working (first time, 2026-09-12)
+```
+windowsAccepted 2   windowsRejected 0   bytesIn 5003   classesMerged 32
+probesNewlySet 39   tier2Records 6      edgeRecordsMerged 47
+edgeSampledObservations 5567            probeInstallMaskRecords 32
+```
+Real telemetry, zero configuration beyond the package scope:
+```
+OrderHandler#handle    431,348 calls  0 errors  p50 4.9us  p90 15.4us  p99 49.2us
+HealthHandler#handle    43,135 calls  0 errors  p50 4.6us  p90 14.8us  p99 47.1us
+```
+Those handlers were found automatically by **interface-boundary detection** (`implements HttpHandler`),
+not by a pattern.
+
+## Every safety property is visible in the live output
+```
+counts          {NOT_DYNAMICALLY_OBSERVABLE: 21, LIVE: 39, UNKNOWN: 26}   <- ZERO candidates, correct
+phasesMissing   [month-end, quarter-end, year-end-close, peak-season, dr-drill]
+runtimeEdges    18 inbound / 13 outbound + "ABSENCE is not evidence of anything"
+instrumentation "~probesInstalled => SILENCE ... (bug #18)"
+precisionPosture "false-negative-biased; do not quote a precision number"
+```
+
+## The lesson, stated once
+**Per-component green is not a pipeline.** Nine of the twenty-three bugs reported success while
+doing nothing, and the six worst lived in the seams — the one place a stand-in guarantees you will
+never look. `g5/` and `isolation/` exist because a "needs Docker" assumption turned out false; this
+e2e run should be a permanent gate for the same reason.

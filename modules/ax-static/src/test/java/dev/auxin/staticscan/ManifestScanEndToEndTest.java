@@ -11,6 +11,7 @@ import dev.auxin.manifest.MethodEntry;
 import dev.auxin.manifest.Resolution;
 import dev.auxin.manifest.SchemaHash;
 import dev.auxin.staticscan.api.PublicApiDetector;
+import dev.auxin.staticscan.entry.BoundaryCatalog;
 import dev.auxin.staticscan.entry.EntryPointCatalog;
 import dev.auxin.staticscan.entry.EntryPointDetector;
 import dev.auxin.staticscan.graph.CallSiteScanner;
@@ -23,6 +24,7 @@ import dev.auxin.staticscan.scan.MethodCandidateFactory;
 import dev.auxin.staticscan.scan.ShortCircuitCatalog;
 import dev.auxin.staticscan.source.ClassSource;
 import dev.auxin.staticscan.source.ClassSources;
+import dev.auxin.staticscan.tier2.Tier2Selector;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -75,11 +77,17 @@ class ManifestScanEndToEndTest {
     }
 
     private static ManifestAssembler assembler() {
+        return assembler(Tier2Selector.automatic());
+    }
+
+    /** The same graph with a chosen tier-2 policy, so the selection rules can be driven directly. */
+    static ManifestAssembler assembler(Tier2Selector tier2Selector) {
         return new ManifestAssembler(
                 new InventoryScanner(),
                 new CallSiteScanner(),
                 new MethodCandidateFactory(new DynamicObservability(), new ShortCircuitCatalog()),
-                new EntryPointDetector(new EntryPointCatalog()),
+                tier2Selector,
+                new EntryPointDetector(new EntryPointCatalog(), BoundaryCatalog.withDefaults()),
                 new PublicApiDetector(),
                 new TestClassifier(),
                 new TestLinkageAnalyzer(),

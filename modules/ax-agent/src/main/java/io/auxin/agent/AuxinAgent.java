@@ -11,6 +11,9 @@ import io.auxin.agent.manifest.Manifest;
 import io.auxin.agent.runtime.BootstrapBridge;
 import io.auxin.agent.runtime.Clock;
 import io.auxin.agent.runtime.DrainThread;
+import io.auxin.agent.runtime.EdgeAggregator;
+import io.auxin.agent.runtime.EdgeRegistry;
+import io.auxin.agent.runtime.EdgeRuntime;
 import io.auxin.agent.runtime.ProbeHolder;
 import io.auxin.agent.runtime.Ring;
 import io.auxin.agent.runtime.Tier2Aggregator;
@@ -118,6 +121,19 @@ public final class AuxinAgent {
             Tier2Runtime.install(ring, clock, true);
         }
 
+        // The edge tier gets its own pre-allocated ring (A7: nothing on this path may allocate,
+        // and two 24-bit ids do not fit into tier-2's packed event). Separate rings also keep a
+        // burst of edges from a sampled trace from evicting tier-2 events, which are the
+        // load-bearing rate and latency numbers under SCOPE-v3.
+        Ring edgeRing = null;
+        EdgeAggregator edgeAggregator = null;
+        if (o.edgesEnabled) {
+            edgeRing = new Ring(o.edgesRingCapacity);
+            edgeAggregator = new EdgeAggregator(o.edgesMaxDistinct);
+            EdgeRuntime.install(edgeRing, o.edgesSampleRate, o.edgesMaxDepth,
+                    o.edgesMaxPerRoot, true);
+        }
+
         // Before the transformer is registered, for two reasons. (1) It loads IgnoreRules here,
         // where the class can be resolved normally — the alternative is resolving it from inside
         // the very first transform, which is a recursive load of a class the transformer needs.
@@ -143,7 +159,8 @@ public final class AuxinAgent {
         inst.addTransformer(strip, true);
 
         HttpSender sender = new HttpSender(o);
-        DrainThread d = new DrainThread(o, m, ring, aggregator, sender, strip, inst, clock, env);
+        DrainThread d = new DrainThread(o, m, ring, aggregator, edgeRing, edgeAggregator,
+                sender, strip, inst, clock, env);
         drain = d;
         d.start();
 
@@ -175,11 +192,48 @@ public final class AuxinAgent {
         return d != null && d.stripNow(c);
     }
 
+    /**
+     * Does Tier-1b believe this class is de-instrumented right now? Ops/test hook.
+     *
+     * <p>The only way to observe the AUTOMATIC strip per class: {@code classesStripped} is a
+     * JVM-wide counter of operations, so it cannot answer "did THIS class get stripped". Not a
+     * latch — a foreign retransform that replays our probes revokes it (G5 section 7).
+     */
+    public static boolean stripped(String dottedClassName) {
+        DrainThread d = drain;
+        return d != null && d.isStripped(dottedClassName);
+    }
+
+    /** Which probe indices of a class actually carry a probe. Ops/test hook; null when unknown. */
+    public static boolean[] installedProbes(String dottedClassName) {
+        return ProbeHolder.installedProbes(dottedClassName);
+    }
+
     /** Forces one window out of band. @return the JSON body that was built. */
     public static String flushNow() {
         DrainThread d = drain;
         return d == null ? "" : d.flush();
     }
+
+    /** Is the runtime call-edge tier armed in this JVM? Ops/test hook. */
+    public static boolean edgesEnabled() { return EdgeRuntime.enabled(); }
+
+    /**
+     * Sampled edge traces currently in flight. Ops/test hook, and the one number that proves the
+     * tier is not leaking: it must return to 0 after every root invocation, including the ones
+     * an exception left through.
+     */
+    public static int edgeActiveTraces() { return EdgeRuntime.activeTraces(); }
+
+    /** Methods that carry call-edge instrumentation in this JVM. Ops/test hook. */
+    public static int edgeIdsRegistered() { return EdgeRegistry.size(); }
+
+    /**
+     * Latches the call-edge tier off for the life of this JVM, down the same path an unexpected
+     * Throwable takes. Break-glass control, and the only way to verify the fail-open latch,
+     * its counter and its one-shot WARN actually work.
+     */
+    public static void edgesForceFailOpen(String why) { EdgeRuntime.forceFailOpen(why); }
 
     /** Is {@code java.lang.$Auxin} installed in this JVM? Ops/test hook. */
     public static boolean bridgeInstalled() { return BootstrapBridge.installed(); }

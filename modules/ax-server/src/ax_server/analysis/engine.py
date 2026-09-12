@@ -28,13 +28,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ax_server.analysis.efp import EfpTracker, efp_keys
+from ax_server.analysis.instrumentation import InstalledProbes, load_installed_probes
 from ax_server.analysis.manifest import ClassEntry, Manifest, MethodEntry
-from ax_server.analysis.models import DEAD_CANDIDATE, MethodRef, Verdict
+from ax_server.analysis.models import (
+    DEAD_CANDIDATE,
+    EligibilityClass,
+    MethodRef,
+    Verdict,
+    effective_eligibility,
+)
 from ax_server.analysis.phases import Interval, PhaseCalendar, PhaseCoverage
 from ax_server.analysis.proposals import ProposalLedger, SqliteProposalLedger
 from ax_server.analysis.ratelimit import DEFAULT_PROPOSALS_PER_DAY, ProposalRateLimiter
 from ax_server.analysis.reachability import compute_reachability, entry_point_kinds
 from ax_server.analysis.rules import MethodFacts, evaluate, first_blocking_reason
+from ax_server.analysis.runtime_edges import RuntimeCallGraph, load_runtime_call_graph
 from ax_server.analysis.suppression import Suppressions
 from ax_server.store.bitset import is_set
 from ax_server.store.models import Window
@@ -65,6 +73,13 @@ class Evidence:
     usable_windows: tuple[Window, ...]
     excluded_windows: tuple[Window, ...]
     phase_coverage: PhaseCoverage
+    #: SCOPE-v3 observed call graph. Loaded once per run: the presence sets
+    #: are one query and every method's rule needs them.
+    runtime_edges: RuntimeCallGraph = field(default_factory=RuntimeCallGraph)
+    #: Bug #18: which probe indices were ACTUALLY INSTALLED, OR-merged across
+    #: pods and windows. One query per run, and every method's rule needs it.
+    #: An empty one means "no mask reported", never "nothing installed".
+    instrumentation: InstalledProbes = field(default_factory=InstalledProbes)
 
     @property
     def window_days(self) -> int:
@@ -97,6 +112,38 @@ class AnalysisRun:
             "phasesMissing": list(self.evidence.phase_coverage.missing),
             "usableWindows": len(self.evidence.usable_windows),
             "excludedWindows": len(self.evidence.excluded_windows),
+            "runtimeEdges": {
+                "reported": self.evidence.runtime_edges.reported,
+                "tierArmed": self.evidence.runtime_edges.armed,
+                "methodsWithObservedInbound": len(self.evidence.runtime_edges.inbound),
+                "methodsWithObservedOutbound": len(self.evidence.runtime_edges.outbound),
+                "edgesSampleRates": {
+                    str(rate or "undeclared"): windows
+                    for rate, windows in sorted(self.evidence.runtime_edges.sample_rates.items())
+                },
+                "note": self.evidence.runtime_edges.caveat(),
+            },
+            # Bug #18: a misconfigured deployment (tier-1 off, or widespread
+            # frame-emission skips) must be VISIBLE here instead of looking
+            # like a codebase full of dead code -- or, now that the gate
+            # exists, instead of looking like a codebase with suspiciously
+            # few candidates and no explanation.
+            "instrumentation": {
+                "maskReported": self.evidence.instrumentation.reported,
+                "maskSupportedByStore": self.evidence.instrumentation.supported,
+                "classesWithMask": self.evidence.instrumentation.classes_reported,
+                "observableButNeverInstrumented": sum(
+                    1
+                    for v in self.verdicts
+                    if v.eligibility is EligibilityClass.NO_PROBE_INSTALLED
+                ),
+                "stripMaskMissingTotal": sum(
+                    w.agent_health.strip_mask_missing for w in self.evidence.usable_windows
+                ) + sum(
+                    w.agent_health.strip_mask_missing for w in self.evidence.excluded_windows
+                ),
+                "note": self.evidence.instrumentation.caveat(),
+            },
             "revoked": [[str(ref), why] for ref, why in self.revoked],
             "precisionPosture": (
                 "false-negative-biased; do not quote a precision number. Closest "
@@ -152,7 +199,14 @@ class AnalysisEngine:
         excluded = [w for w in windows if not w.usable_as_death_evidence]
         intervals: list[Interval] = [(w.start, w.end) for w in usable]
         coverage = self.config.phase_calendar.evaluate(intervals)
-        return Evidence(build_sha, tuple(usable), tuple(excluded), coverage)
+        return Evidence(
+            build_sha,
+            tuple(usable),
+            tuple(excluded),
+            coverage,
+            load_runtime_call_graph(self.store, build_sha),
+            load_installed_probes(self.store, build_sha),
+        )
 
     # -- derivation ------------------------------------------------------
 
@@ -242,9 +296,23 @@ class AnalysisEngine:
         suppression = self.suppressions.match(ref)
         entry_kind = self._entry_kinds.get(klass.name, "none")
 
+        # Bug #18: the tri-state install mask. `None` (no window reported a
+        # mask for this class) leaves every downstream decision exactly as it
+        # was before #18 -- abstaining, not guessing in either direction.
+        installed = ev.instrumentation.installed(klass.name, method.idx)
+        eligibility = effective_eligibility(method.eligibility, installed)
+
         proposal = self.ledger.get(build_sha, ref)
-        keys = efp_keys(entry_kind, str(method.eligibility))
+        # Keyed on the EFFECTIVE class, so "observable but never instrumented"
+        # is its own C55 rule class and cannot hide inside OBSERVABLE's rate.
+        keys = efp_keys(entry_kind, str(eligibility))
         disabled_key = self.efp.disabled(keys)
+
+        # SCOPE-v3. Presence is read from the eagerly loaded sets; the counts
+        # are fetched only when there is something to count, and they never
+        # participate in the death argument -- see rules.py clause 8b.
+        inbound = ev.runtime_edges.inbound_evidence(klass.name, method.idx)
+        outbound = ev.runtime_edges.outbound_evidence(klass.name, method.idx)
 
         facts = MethodFacts(
             ref=ref,
@@ -260,9 +328,17 @@ class AnalysisEngine:
             usable_windows=len(ev.usable_windows),
             excluded_windows=len(ev.excluded_windows),
             entry_point_kind=entry_kind,
+            probe_installed=installed,
             efp_disabled_key=disabled_key,
             rate_limit_reason=None,
             min_window_days=self.config.min_window_days,
+            runtime_inbound_edges=inbound.observed_edges,
+            runtime_outbound_edges=outbound.observed_edges,
+            runtime_inbound_observations=inbound.sampled_observations,
+            runtime_edges_sample_rate=(
+                inbound.uniform_sample_rate or ev.runtime_edges.uniform_sample_rate
+            ),
+            runtime_edges_reported=ev.runtime_edges.reported,
         )
         outcome = evaluate(facts)
 
@@ -287,9 +363,20 @@ class AnalysisEngine:
             phases_missing=list(ev.phase_coverage.missing),
             last_seen=last_seen,
             static_reachable=static,
+            # Two fields, never one. `static` over-approximates (and A5 says
+            # it also misses 61% of what executes); the runtime graph
+            # under-approximates. A merged boolean would be worse than either.
+            runtime_reachable=facts.runtime_reachable,
+            runtime_inbound_edges=inbound.observed_edges,
+            runtime_outbound_edges=outbound.observed_edges,
+            runtime_inbound_observations=inbound.sampled_observations,
+            runtime_edges_sample_rate=facts.runtime_edges_sample_rate,
+            runtime_edges_reported=ev.runtime_edges.reported,
             suppressed=suppression is not None,
             public_api=klass.is_public_api,
-            eligibility=method.eligibility,
+            probe_installed=installed,
+            probe_install_mask_reported=ev.instrumentation.reported_for(klass.name),
+            eligibility=eligibility,
             first_proposed_at=proposal.first_proposed_at if proposal and proposal.active else None,
             revoked_reason=(
                 proposal.revoked_reason if proposal and not proposal.active else None

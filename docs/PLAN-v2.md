@@ -298,3 +298,56 @@ structural impossibility, and `ax.probe.mode=blind` is a kept, tested, one-flag 
 - **A real OSGi/JBoss/JPMS container** — the bridge is proven against a null-parent `URLClassLoader`,
   which reproduces the delegation property but not a real container.
 - **G5** — 3-agent coexistence (us + JaCoCo + OTel) under traffic.
+
+
+---
+
+# BUG #18 — Tier-1b could never fire, and it invalidated the headline claim
+
+**"Steady-state overhead reaches zero" was false for most real classes**, and the mechanism was
+correct the whole time — it simply could never be reached.
+
+`ProbeHolder` sizes a class's probe array to the manifest's `probeCount` (every probe-**eligible**
+method). `ProbeEmitter` installs at only some of those indices: C51-exempt methods, methods whose
+entry stack-map frame cannot be built safely (`frameEmissionUnsupported`), and all of them when
+`ax.tier1.enabled=false`. **An index with no probe is never written by anything.** So the gate —
+`CoverageSnapshot.allSet(wholeArray)` — was not slow to satisfy, it was **unsatisfiable for the life
+of the JVM** for any class holding one such method. Those classes were never strip candidates and
+kept their probes on the hot path for ever. **13 of 20 probed demo classes** were affected.
+
+**Why it hid for the entire project:** every strip the suites exercised was a *forced* one
+(`stripNow`), which bypasses the gate — and the deleted in-agent `ManifestTool` stand-in
+under-detected C51-exempt methods, so the real exposure only appeared once the harnesses were
+pointed at the real `ax-static`.
+
+## The fix
+An **installed-probe mask**: a manifest-sized `boolean[]` set at the one place that knows a probe
+went in, registered *before* the probe array exists so no reader can see an array without its mask,
+and OR-ed across loaders (child-first, OSGi) as the conservative merge. Written once per class at
+transform time, read only by the drain thread — **nothing added to any per-call path.**
+`allSet(live)` becomes `allInstalledSet(live, installed)`, which returns **false for an empty
+installed set** so a class with nothing to strip is excluded rather than counted as a successful
+strip (the G5-BUG-3 bookkeeping rule).
+
+## Measured, JDK 11/17/21 identical
+| | before | after |
+|---|---|---|
+| `classesAutoStrippedDuringTraffic` | 2 | **4** |
+| `classesStripped` | 5 | **7** |
+| `stripFailures` / `stripMaskMissing` | 0 | **0** |
+
+The three gt-first orderings stay at 0 **by design** — JaCoCo has inverted our `IFNE` there so no
+strip can succeed (G5-BUG-3, unchanged); `stripBlocked` rises to 15 = 5 eligible classes x 3 bounded
+attempts, i.e. the pre-existing condition reported for more classes, not a new failure.
+
+Suites: smoke 123->**145** per run x4, 119->**141**, 140->**162**, 121->**143**, javap 37/37;
+negative 105->**106**; isolation **1146/0**; g5 **972/0**. No assertion weakened.
+
+**The new assertion was mutation-checked**: reverting `allInstalledSet` to the whole-array test made
+exactly the three auto-strip assertions fail (142/145) for the right reason, then it was reverted and
+re-verified. It uses the drain thread, never `stripNow`.
+
+## The second half: the payload was shipping unsettable bits as death evidence
+See CONTRACTS §2 `coverage[].probesInstalled` and its reading rule. The C51 subset was already
+recoverable via the manifest, but `frameEmissionUnsupported` and tier-1-off are per-JVM facts a
+manifest cannot express — so a tier-1-disabled window read as "every method is dead."

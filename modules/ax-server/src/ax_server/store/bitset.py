@@ -15,6 +15,7 @@ from collections.abc import Iterable, Iterator
 
 __all__ = [
     "BitsetDecodeError",
+    "and_not",
     "decode_b64",
     "encode_b64",
     "from_indices",
@@ -56,6 +57,26 @@ def or_merge(existing: bytes, incoming: bytes) -> bytes:
     out = bytearray(existing)
     for i, byte in enumerate(incoming):
         out[i] |= byte
+    return bytes(out)
+
+
+def and_not(a: bytes, b: bytes) -> bytes:
+    """`a & ~b` -- the bits set in `a` and clear in `b`.
+
+    This is the ONLY expression in the system that yields death evidence, and
+    the reading rule it implements is the whole point of bug #18:
+
+        probes                     -> liveness (a set bit means it ran)
+        probesInstalled & ~probes  -> the ONLY death evidence
+        ~probesInstalled           -> SILENCE; not evidence of anything
+
+    Result width is `len(a)`: an index past the end of `a` is not in `a` at
+    all, and one past the end of `b` is clear there, so widening in either
+    direction would invent an index that nothing reported.
+    """
+    out = bytearray(a)
+    for i in range(min(len(a), len(b))):
+        out[i] &= ~b[i] & 0xFF
     return bytes(out)
 
 

@@ -8,6 +8,25 @@ Records **no values**: no arguments, no return values, no request bodies. Only i
 booleans, counters, exception class names, and normalized shapes. That is a permanent product
 boundary, not a phase-one limitation.
 
+## Scope: one agent
+
+Auxin is the **only** agent in the runtime path. It is not a distro, it does not embed
+OpenTelemetry, and it does not need a second or third agent attached to be useful. See
+`docs/SCOPE-v3.md` for the decision and what it rules out.
+
+It still *coexists* with OTel and JaCoCo if you already run them — that is a verified compatibility
+property (gate `g5/`, 972 assertions: all three attached under traffic, 4,430 spans, and 71 methods
+compared between two coverage engines with **0 disagreements**) — but it is not the deployment shape.
+
+| question | answer |
+|---|---|
+| was this method ever executed? | **yes** — every in-scope method, one bit, near-zero cost |
+| which branch arms never ran? | no — dropped from the runtime path (see A3) |
+| TPS / error rate / p50-p90-p99 | **yes** — automatically on every detected entry point (controllers, `@Scheduled`, listeners, `main`, SPI), plus a glob allowlist, under an enforced budget |
+| what calls what, at runtime? | **yes, sampled** — decided once per boundary-method entry, so unsampled paths cost zero |
+| what calls what, statically? | **yes** — CHA graph, every edge labelled `exact \| cha \| unresolved`, and measured ~61% unsound, so it only ever corroborates |
+| request flow across services | **no.** Needs context propagation, which needs per-request allocation, which forfeits zero-allocation and strippability. Out of scope by choice |
+
 ## Why this can be done without hurting the host
 
 | concern | answer |

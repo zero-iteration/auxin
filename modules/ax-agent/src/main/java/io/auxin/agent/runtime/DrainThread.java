@@ -18,11 +18,14 @@ import java.util.Map;
 /**
  * The single background thread. It owns every aggregate in the agent.
  *
- * <p>Three jobs, in order, on a fixed interval:
+ * <p>Four jobs, in order, on a fixed interval:
  * <ol>
- *   <li>drain the MPSC ring and fold events into the (single-writer, non-atomic) aggregator</li>
+ *   <li>drain the MPSC rings — tier-2's and the call-edge tier's — and fold their events into
+ *       the (single-writer, non-atomic) aggregators</li>
  *   <li>every {@code ax.flush.interval.ms}, serialise a window and POST it</li>
- *   <li>retransform classes whose probes are all set, removing their probes (Tier-1b)</li>
+ *   <li>retransform classes whose INSTALLED probes are all set, removing their probes
+ *       (Tier-1b — see {@link #strippable})</li>
+ *   <li>reap a leaked edge-trace gate, if there is one</li>
  * </ol>
  *
  * <p><b>No shutdown hook</b>, ever (C17): Kubernetes SIGKILL and OOMKill run none, so anything
@@ -32,9 +35,20 @@ public final class DrainThread implements Runnable {
 
     private static final int DRAIN_LIMIT = 65536;
 
+    /**
+     * Drain cycles the edge gate may stay non-zero with no new edge event before it is treated
+     * as a leaked trace. 25 cycles is 5s at the default 200ms interval. A root invocation that
+     * legitimately runs longer than that without recording a new edge (a batch job that already
+     * hit its per-root cap) is indistinguishable from a thread that died between
+     * {@code rootEnter} and {@code rootExit}, so it is counted rather than assumed away.
+     */
+    private static final int EDGE_REAP_CYCLES = 25;
+
     private final Options options;
     private final Manifest manifest;
     private final Ring ring;
+    private final Ring edgeRing;
+    private final EdgeAggregator edgeAggregator;
     private final Tier2Aggregator aggregator;
     private final HttpSender sender;
     private final ProbeStripper stripper;
@@ -81,13 +95,20 @@ public final class DrainThread implements Runnable {
     private volatile String lastPayload = "";
     private long windowStartMs = System.currentTimeMillis();
 
+    /** Consecutive drain cycles with the edge gate up and no new edge event. Drain thread only. */
+    private int edgeIdleCycles;
+    private long lastEdgeEvents;
+
     public DrainThread(Options options, Manifest manifest, Ring ring, Tier2Aggregator aggregator,
+                       Ring edgeRing, EdgeAggregator edgeAggregator,
                        HttpSender sender, ProbeStripper stripper, Instrumentation instrumentation,
                        Clock clock, EnvironmentClassification environment) {
         this.options = options;
         this.manifest = manifest;
         this.ring = ring;
         this.aggregator = aggregator;
+        this.edgeRing = edgeRing;
+        this.edgeAggregator = edgeAggregator;
         this.sender = sender;
         this.stripper = stripper;
         this.instrumentation = instrumentation;
@@ -120,12 +141,14 @@ public final class DrainThread implements Runnable {
             }
             try {
                 if (ring != null) ring.drain(aggregator, DRAIN_LIMIT);
+                if (edgeRing != null) edgeRing.drain(edgeAggregator, DRAIN_LIMIT);
                 long now = System.currentTimeMillis();
                 if (now - lastFlush >= options.flushIntervalMs) {
                     flush();
                     lastFlush = now;
                 }
                 if (options.stripEnabled) stripCoveredClasses();
+                reapStaleEdgeTraces();
             } catch (Throwable t) {
                 // the drain thread must outlive every individual failure
                 Log.debug("drain cycle failed", t);
@@ -136,11 +159,13 @@ public final class DrainThread implements Runnable {
     /** Builds, serialises and sends one window. @return the JSON that was built. */
     public synchronized String flush() {
         if (ring != null) ring.drain(aggregator, DRAIN_LIMIT);
+        if (edgeRing != null) edgeRing.drain(edgeAggregator, DRAIN_LIMIT);
         WindowPayload w = buildWindow();
         String json = Batch.toJson(w);
         lastPayload = json;
         if (sender.enabled()) sender.send(json);
         aggregator.resetWindow();
+        if (edgeAggregator != null) edgeAggregator.resetWindow();
         windowStartMs = w.windowEndMs;
         return json;
     }
@@ -172,9 +197,25 @@ public final class DrainThread implements Runnable {
         w.degradedReason = Health.degradedReason();
         w.classesInstrumented = Health.classesInstrumented();
         w.classesStripped = Health.classesStripped();
+
+        // Call-edge tier (SCOPE-v3). Cumulative counters, exactly like ringDropped and
+        // transformFailures; the per-window graph is the edges[] array below.
+        w.edgesEnabled = options.edgesEnabled;
+        w.edgesSampleRate = options.edgesSampleRate;
+        w.edgesSampledRoots = Health.edgeRootsSampled();
+        w.edgesDropped = Health.edgeRingDropped();
+        w.edgesTruncatedDepth = Health.edgesTruncatedDepth();
+        w.edgesTruncatedRoot = Health.edgesTruncatedRoot();
+        w.edgeTierFailures = Health.edgeTierFailures();
+        w.edgeTracesReaped = Health.edgeTracesReaped();
+        if (edgeAggregator != null) {
+            w.edgesRecorded = edgeAggregator.eventsProcessed();
+            w.edgesTruncatedDistinct = edgeAggregator.distinctRefused();
+        }
         w.stripFailures = Health.stripFailures();
         w.stripBlocked = Health.stripsBlocked();
         w.stripReArms = Health.stripReArms();
+        w.stripMaskMissing = Health.stripMasksMissing();
 
         // "I was configured to do work and did none" must never look like a clean run
         // (G5-BUG-1). classesInstrumented is cumulative for the JVM, so this latches itself off
@@ -216,6 +257,19 @@ public final class DrainThread implements Runnable {
             Manifest.ClassEntry entry = manifest.byInternalName(cls.replace('.', '/'));
             c.schemaHash = entry == null ? "" : entry.schemaHash;
             c.probesBase64 = CoverageSnapshot.toBase64(probes);
+            // C51 requires a not-dynamically-observable method to stay DISTINGUISHABLE from a
+            // de-instrumented one, and neither may ever read as "never ran". The probe bitset
+            // alone cannot express that: a slot with no probe is never written, so its zero is
+            // silence, not an observation. Ship the mask next to it.
+            //
+            // When the mask is unknown (structurally impossible, counted as stripMaskMissing)
+            // an ALL-ZERO mask is the only safe answer: it says "no index in this class may be
+            // read as evidence of death", which loses a dead-code candidate. Claiming the
+            // opposite would invent up to probeCount false dead methods.
+            boolean[] installed = ProbeHolder.installedProbes(cls);
+            c.probesInstalledBase64 = CoverageSnapshot.toBase64(
+                    installed != null && installed.length == probes.length
+                            ? installed : new boolean[probes.length]);
             w.coverage.add(c);
         }
 
@@ -239,7 +293,65 @@ public final class DrainThread implements Runnable {
             }
             w.tier2.add(t);
         }
+
+        if (edgeAggregator != null) {
+            final WindowPayload target = w;
+            edgeAggregator.forEach(new EdgeAggregator.EdgeVisitor() {
+                @Override
+                public void edge(int callerEdgeId, int calleeEdgeId, long count) {
+                    String from = EdgeRegistry.className(callerEdgeId);
+                    String to = EdgeRegistry.className(calleeEdgeId);
+                    // An unknown id cannot happen (ids are assigned before the bytecode that
+                    // pushes them exists) but a half-registered edge must never become an edge
+                    // between nulls on the wire.
+                    if (from == null || to == null) return;
+                    WindowPayload.Edge e = new WindowPayload.Edge();
+                    e.fromClass = from;
+                    e.fromIdx = EdgeRegistry.idx(callerEdgeId);
+                    e.toClass = to;
+                    e.toIdx = EdgeRegistry.idx(calleeEdgeId);
+                    e.count = count;
+                    target.edges.add(e);
+                }
+            });
+        }
         return w;
+    }
+
+    /**
+     * The edge tier's safety valve. {@code EdgeRuntime}'s gate is a count of in-flight sampled
+     * traces, and a trace that is never closed leaves it non-zero for ever — at which point
+     * every instrumented call in the JVM pays a thread-local read instead of a load and a
+     * branch. The root's {@code catch (Throwable)} handler is what makes that impossible in
+     * normal operation; this is what makes it recoverable when something abnormal happens
+     * (a thread killed outright between entry and exit).
+     *
+     * <p>Resetting the gate can at worst truncate one in-flight trace, and it is counted, so the
+     * wire can never say "no edges" without also saying why.
+     */
+    private void reapStaleEdgeTraces() {
+        if (edgeRing == null || edgeAggregator == null) return;
+        if (EdgeRuntime.activeTraces() == 0) {
+            edgeIdleCycles = 0;
+            return;
+        }
+        final long events = edgeAggregator.eventsProcessed();
+        if (events != lastEdgeEvents) {
+            lastEdgeEvents = events;
+            edgeIdleCycles = 0;
+            return;
+        }
+        if (++edgeIdleCycles < EDGE_REAP_CYCLES) return;
+        edgeIdleCycles = 0;
+        if (!EdgeRuntime.reapStaleTraces()) return;
+        Health.edgeTraceReaped();
+        if (Health.warnOnce("edgeTraceReaped")) {
+            Log.warn("an edge trace was open for " + (EDGE_REAP_CYCLES * options.drainIntervalMs)
+                    + "ms with no new edge recorded, so its gate has been reset. Either a thread "
+                    + "died between a boundary method's entry and its exit, or a boundary method "
+                    + "really does run that long after hitting ax.edges.max.per.root. Counted as "
+                    + "agentHealth.edgeTracesReaped; coverage and tier-2 are unaffected.");
+        }
     }
 
     /**
@@ -257,7 +369,7 @@ public final class DrainThread implements Runnable {
             String cls = e.getKey();
             if (stripped.contains(cls)) continue;
             if (attempts(cls) >= MAX_STRIP_ATTEMPTS) continue;   // strip-blocked, bounded
-            if (!CoverageSnapshot.allSet(e.getValue()) && !forcedStrips.contains(cls)) continue;
+            if (!strippable(cls, e.getValue())) continue;
             Class<?> c = ProbeHolder.loadedClass(cls);
             if (c == null) continue;    // pre-55 field fallback: no strip handle, never stripped
             batch.add(c);
@@ -276,7 +388,7 @@ public final class DrainThread implements Runnable {
                 if (recordStripOutcome(names.get(i))) real++;
             }
             Log.debug("de-instrumented " + real + " of " + names.size()
-                    + " fully covered class(es)");
+                    + " class(es) whose installed probes were all set");
         } catch (Throwable t) {
             Health.stripFailure();
             Log.debug("retransform (strip) failed", t);
@@ -284,6 +396,67 @@ public final class DrainThread implements Runnable {
             for (int i = 0; i < names.size(); i++) {
                 stripper.disarm(names.get(i).replace('.', '/'));
             }
+        }
+    }
+
+    /**
+     * Is this class a Tier-1b candidate on this cycle?
+     *
+     * <p><b>The gate is the installed probes, not the whole array.</b> The array is sized to
+     * every probe-eligible method in the build manifest, but {@code ProbeEmitter} installs a
+     * probe at only some of those indices — C51 exempts a method that cannot be covered
+     * dynamically (a single-instruction body, a plain field accessor, a delegating constructor),
+     * an entry frame that cannot be built safely skips one method, and
+     * {@code ax.tier1.enabled=false} skips all of them. Nothing ever writes a slot with no probe
+     * in it, so the old {@code allSet(array)} gate was <b>unsatisfiable for the life of the
+     * JVM</b> for any class carrying one such method: it stayed a non-candidate for ever and its
+     * probes stayed on the hot path, which is precisely the cost this tier exists to remove. On
+     * the G5 demo that was 13 of 20 probed classes.
+     *
+     * <p>Three answers, in order:
+     * <ol>
+     *   <li><b>A forced strip re-arms unconditionally.</b> {@link #stripNow} only records a class
+     *       here after probes were genuinely removed from it, so it is strippable by
+     *       construction; an explicit operator request must not be silently dropped because the
+     *       class was never fully covered.</li>
+     *   <li><b>No usable mask: fail open, count, log once.</b> Structurally impossible (the mask
+     *       is written before the array, from the same manifest {@code probeCount}), so it is
+     *       reported rather than assumed away. Keeping the probes costs CPU; guessing costs
+     *       either a phantom strip or a permanently-installed probe.</li>
+     *   <li>Otherwise every INSTALLED probe must be set. A class with <b>no</b> installed probe
+     *       has nothing to strip and is excluded here rather than counted as a successful strip —
+     *       {@link CoverageSnapshot#allInstalledSet} returns false for an empty installed set for
+     *       exactly that reason.</li>
+     * </ol>
+     */
+    private boolean strippable(String cls, boolean[] live) {
+        try {
+            if (forcedStrips.contains(cls)) return true;
+            final boolean[] installed = ProbeHolder.installedProbes(cls);
+            if (installed == null || live == null || installed.length != live.length) {
+                undecidable(cls, "mask="
+                        + (installed == null ? "absent" : "length " + installed.length)
+                        + ", probes=" + (live == null ? "absent" : "length " + live.length));
+                return false;
+            }
+            return CoverageSnapshot.allInstalledSet(live, installed);
+        } catch (Throwable t) {
+            // Nothing here can throw, which is exactly why an escape must not be swallowed:
+            // the whole class of bug being fixed is a Tier-1b decision that went wrong in
+            // silence. Same outcome as a missing mask — keep the probes, count, say so once.
+            undecidable(cls, String.valueOf(t));
+            return false;
+        }
+    }
+
+    /** Tier-1b declined to decide about one class. Fail open: keep the probes, count, warn once. */
+    private void undecidable(String cls, String why) {
+        Health.stripMaskMissing();
+        if (Health.warnOnce("stripMaskMissing:" + cls)) {
+            Log.warn("Tier-1b cannot tell which of " + cls + "'s probe slots actually carry a "
+                    + "probe (" + why + "), so the class keeps its probes and its steady-state "
+                    + "cost. Coverage and correctness are unaffected. Counted as "
+                    + "agentHealth.stripMaskMissing.");
         }
     }
 
@@ -357,6 +530,16 @@ public final class DrainThread implements Runnable {
     private int attempts(String cls) {
         Integer n = stripAttempts.get(cls);
         return n == null ? 0 : n.intValue();
+    }
+
+    /**
+     * Does Tier-1b currently believe this class is de-instrumented? Ops/test hook.
+     *
+     * <p>Revocable, like the set behind it: a foreign retransform that replays our probes takes
+     * a class back out (G5 section 7), so this is the live belief and not a latch.
+     */
+    public boolean isStripped(String dottedClassName) {
+        return dottedClassName != null && stripped.contains(dottedClassName);
     }
 
     /**

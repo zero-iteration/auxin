@@ -25,7 +25,38 @@ import java.util.Objects;
 public final class Manifest {
 
     /** The only schema version this module reads or writes. */
-    public static final int SCHEMA_VERSION = 1;
+    /**
+     * The manifest schema version this writer emits.
+     *
+     * <p>BUG #19: this was {@code 1} while the writer emitted every one of v2's six fields
+     * ({@code isTest}, {@code dynamicallyObservable}, {@code shortCircuitable}, {@code sccId},
+     * {@code testOnlyReachable}, and {@code semantics} on edges). CONTRACTS.md §1 says a v1
+     * manifest's absent fields default to their safe direction, "which means a v1 manifest
+     * nominates nothing" -- so a reader that honoured the contract would ignore those fields in a
+     * document that carries them, and read a fully-populated manifest as nominating nothing.
+     *
+     * <p>It stayed invisible because the deleted in-agent {@code ManifestTool} stand-in stamped
+     * {@code 2}, and the agent tolerates either. Same root cause as bug #17 on the wire: two
+     * components each verified against a stand-in for the other, so the seam went untested.
+     */
+    public static final int SCHEMA_VERSION = 2;
+
+    /**
+     * Manifest versions this build can READ.
+     *
+     * <p>A set, not a single constant, for the reason bug #17 taught us on the wire: every
+     * addition so far has been purely additive, and {@link ManifestReader} already ignores
+     * unknown keys and defaults every absent field to its safe direction. A reader pinned to one
+     * exact version rejects a document it could read perfectly well -- and worse, pins whichever
+     * version it was written against, so bumping the writer breaks every older fixture at once.
+     *
+     * <p>The refusal itself still matters and is still here: an <em>unknown</em> version may carry
+     * a different probe-index assignment (A14 defect 2), and silently accepting that is how
+     * coverage gets attributed to the wrong methods.
+     */
+    public static final java.util.Set<Integer> READABLE_SCHEMA_VERSIONS =
+            java.util.Collections.unmodifiableSet(
+                    new java.util.LinkedHashSet<Integer>(java.util.Arrays.asList(1, 2)));
 
     private final int schemaVersion;
     private final String buildSha;
